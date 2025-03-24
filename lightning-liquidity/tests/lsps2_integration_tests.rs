@@ -1,4 +1,4 @@
-#![cfg(all(test, feature = "std"))]
+#![cfg(all(test, feature = "std", feature = "time"))]
 
 mod common;
 
@@ -49,6 +49,7 @@ fn setup_test_lsps2_nodes<'a, 'b, 'c>(
 		#[cfg(lsps1_service)]
 		lsps1_service_config: None,
 		lsps2_service_config: Some(lsps2_service_config),
+		lsps5_service_config: None,
 		advertise_service: true,
 	};
 
@@ -56,6 +57,7 @@ fn setup_test_lsps2_nodes<'a, 'b, 'c>(
 	let client_config = LiquidityClientConfig {
 		lsps1_client_config: None,
 		lsps2_client_config: Some(lsps2_client_config),
+		lsps5_client_config: None,
 	};
 	let lsps_nodes = create_service_and_client_nodes(nodes, service_config, client_config);
 
