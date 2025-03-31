@@ -71,9 +71,15 @@ pub enum LSPS5ServiceEvent {
 		request_id: LSPSRequestId,
 	},
 
-	/// A notification needs to be sent to a client's webhook
-	///
 	/// This event occurs when the LSP needs to send a notification to a client's webhook.
+	///
+	/// When this event is received, the LSP should:
+	/// 1. Serialize the notification to JSON
+	/// 2. Make an HTTP POST request to the provided URL with the given headers and the serialized notification
+	///
+	/// When the client receives this notification, they will process it and generate a
+	/// `WebhookNotificationReceived` event on their side. The client will validate the
+	/// signature using the LSP's node ID to ensure the notification is authentic.
 	SendWebhookNotifications {
 		/// Client node ID to be notified
 		counterparty_node_id: PublicKey,
