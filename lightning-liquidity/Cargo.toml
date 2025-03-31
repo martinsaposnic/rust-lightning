@@ -47,5 +47,4 @@ check-cfg = [
 	"cfg(c_bindings)",
 	"cfg(backtrace)",
 	"cfg(ldk_bench)",
-	"cfg(time)",
 ]
