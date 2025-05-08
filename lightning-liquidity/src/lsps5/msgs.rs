@@ -9,24 +9,27 @@
 
 //! LSPS5 message formats for webhook registration
 
-use core::fmt;
-use core::fmt::Display;
-use core::ops::Deref;
-
 use crate::alloc::string::ToString;
 use crate::lsps0::ser::LSPSMessage;
 use crate::lsps0::ser::LSPSRequestId;
 use crate::lsps0::ser::LSPSResponseError;
-use alloc::string::String;
-use alloc::vec::Vec;
+
+use super::url_utils::LSPSUrl;
+
 use lightning_types::string::UntrustedString;
+
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::ser::SerializeStruct;
 use serde::Serializer;
 use serde::{Deserialize, Serialize};
 
-use super::url_utils::LSPSUrl;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use core::fmt;
+use core::fmt::Display;
+use core::ops::Deref;
 
 /// Maximum allowed length for an `app_name` (in bytes).
 pub const MAX_APP_NAME_LENGTH: usize = 64;
@@ -34,11 +37,18 @@ pub const MAX_APP_NAME_LENGTH: usize = 64;
 /// Maximum allowed length for a webhook URL (in characters).
 pub const MAX_WEBHOOK_URL_LENGTH: usize = 1024;
 
-pub(crate) const LSPS5_TOO_LONG_ERROR_CODE: i32 = 500;
-pub(crate) const LSPS5_URL_PARSE_ERROR_CODE: i32 = 501;
-pub(crate) const LSPS5_UNSUPPORTED_PROTOCOL_ERROR_CODE: i32 = 502;
-pub(crate) const LSPS5_TOO_MANY_WEBHOOKS_ERROR_CODE: i32 = 503;
-pub(crate) const LSPS5_APP_NAME_NOT_FOUND_ERROR_CODE: i32 = 1010;
+/// Either the app name or the webhook URL is too long.
+pub const LSPS5_TOO_LONG_ERROR_CODE: i32 = 500;
+/// The provided URL could not be parsed.
+pub const LSPS5_URL_PARSE_ERROR_CODE: i32 = 501;
+/// The provided URL is not HTTPS.
+pub const LSPS5_UNSUPPORTED_PROTOCOL_ERROR_CODE: i32 = 502;
+/// The client has too many webhooks registered.
+pub const LSPS5_TOO_MANY_WEBHOOKS_ERROR_CODE: i32 = 503;
+/// The app name was not found.
+pub const LSPS5_APP_NAME_NOT_FOUND_ERROR_CODE: i32 = 1010;
+/// An unknown error occurred.
+pub const LSPS5_UNKNOWN_ERROR_CODE: i32 = 1000;
 
 pub(crate) const LSPS5_SET_WEBHOOK_METHOD_NAME: &str = "lsps5.set_webhook";
 pub(crate) const LSPS5_LIST_WEBHOOKS_METHOD_NAME: &str = "lsps5.list_webhooks";
@@ -51,84 +61,234 @@ pub(crate) const LSPS5_LIQUIDITY_MANAGEMENT_REQUEST_NOTIFICATION: &str =
 	"lsps5.liquidity_management_request";
 pub(crate) const LSPS5_ONION_MESSAGE_INCOMING_NOTIFICATION: &str = "lsps5.onion_message_incoming";
 
+/// Protocol errors defined in the LSPS5/bLIP-55 specification.
+///
+/// These errors are sent over JSON-RPC when protocol-level validation fails
+/// and correspond directly to error codes defined in the LSPS5 specification.
+/// LSPs must use these errors when rejecting client requests.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-/// Structured LSPS5 error
-pub enum LSPS5Error {
-	/// The provided input was too long.
-	TooLong(String),
-	/// The provided URL could not be parsed.
+pub enum LSPS5ProtocolError {
+	/// App name exceeds the maximum allowed length of 64 bytes.
+	///
+	/// Sent when registering a webhook with an app name longer than MAX_APP_NAME_LENGTH.
+	AppNameTooLong,
+
+	/// Webhook URL exceeds the maximum allowed length of 1024 bytes.
+	///
+	/// Sent when registering a webhook with a URL longer than MAX_WEBHOOK_URL_LENGTH.
+	WebhookUrlTooLong,
+
+	/// Webhook URL is not a valid URL.
+	///
+	/// Sent when the provided webhook URL cannot be parsed or is syntactically invalid.
 	UrlParse(String),
-	/// The provided URL used an unsupported protocol.
-	UnsupportedProtocol(String),
-	/// The provided URL contained too many webhooks.
+
+	/// Webhook URL does not use HTTPS.
+	///
+	/// The LSPS5 specification requires all webhook URLs to use HTTPS.
+	UnsupportedProtocol,
+
+	/// Client has reached their maximum allowed number of webhooks.
+	///
+	/// The string contains the maximum number of webhooks allowed.
 	TooManyWebhooks(String),
-	/// The provided URL did not contain an app name.
-	AppNameNotFound(String),
-	/// The provided URL contained an app name that was not found.
-	Other {
-		/// Numeric code for matching legacy behaviors.
-		code: i32,
-		/// Human‐readable message.
-		message: String,
-	},
+
+	/// The specified app name was not found in the registered webhooks.
+	///
+	/// Sent when trying to update or remove a webhook that doesn't exist.
+	AppNameNotFound,
+
+	/// An unspecified or unexpected error occurred.
+	UnknownError,
 }
 
-impl Serialize for LSPS5Error {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+impl LSPS5ProtocolError {
+	/// private code range so we never collide with the spec’s codes
+	pub fn code(&self) -> i32 {
+		match self {
+			LSPS5ProtocolError::AppNameTooLong | LSPS5ProtocolError::WebhookUrlTooLong => {
+				LSPS5_TOO_LONG_ERROR_CODE
+			},
+			LSPS5ProtocolError::UrlParse(_) => LSPS5_URL_PARSE_ERROR_CODE,
+			LSPS5ProtocolError::UnsupportedProtocol => LSPS5_UNSUPPORTED_PROTOCOL_ERROR_CODE,
+			LSPS5ProtocolError::TooManyWebhooks { .. } => LSPS5_TOO_MANY_WEBHOOKS_ERROR_CODE,
+			LSPS5ProtocolError::AppNameNotFound => LSPS5_APP_NAME_NOT_FOUND_ERROR_CODE,
+			LSPS5ProtocolError::UnknownError => LSPS5_UNKNOWN_ERROR_CODE,
+		}
+	}
+	/// The error message for the LSPS5 protocol error.
+	pub fn message(&self) -> String {
+		match self {
+			LSPS5ProtocolError::AppNameTooLong => {
+				format!("App name exceeds maximum length of {} bytes", MAX_APP_NAME_LENGTH)
+			},
+			LSPS5ProtocolError::WebhookUrlTooLong => {
+				format!("Webhook URL exceeds maximum length of {} bytes", MAX_WEBHOOK_URL_LENGTH)
+			},
+			LSPS5ProtocolError::UrlParse(m) => m.clone(),
+			LSPS5ProtocolError::UnsupportedProtocol => {
+				"Unsupported protocol: HTTPS is required".to_string()
+			},
+			LSPS5ProtocolError::TooManyWebhooks(max) => {
+				format!("Maximum of {} webhooks allowed per client", max)
+			},
+			LSPS5ProtocolError::AppNameNotFound => "App name not found".to_string(),
+			LSPS5ProtocolError::UnknownError => "Unknown error".to_string(),
+		}
+	}
+}
+
+impl Serialize for LSPS5ProtocolError {
+	fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
 	where
 		S: Serializer,
 	{
-		let mut m = serializer.serialize_struct("error", 3)?;
-		m.serialize_field("code", &self.code())?;
-		m.serialize_field("message", &self.message())?;
-		m.serialize_field("data", &Option::<String>::None)?;
-		m.end()
+		let mut s = ser.serialize_struct("error", 3)?;
+		s.serialize_field("code", &self.code())?;
+		s.serialize_field("message", &self.message())?;
+		let data = match self {
+			LSPS5ProtocolError::TooManyWebhooks(max) => Some(max),
+			_ => None,
+		};
+		s.serialize_field("data", &data)?;
+		s.end()
 	}
 }
 
-impl LSPS5Error {
-	/// Numeric code for matching legacy behaviors
+/// Client-side validation and processing errors.
+///
+/// Unlike LSPS5ProtocolError, these errors are not part of the LSPS5 specification
+/// and are meant for internal use in the client implementation. They represent
+/// failures when parsing, validating, or processing webhook notifications.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LSPS5ClientError {
+	/// Signature verification failed.
+	///
+	/// The cryptographic signature from the LSP node doesn't validate.
+	InvalidSignature,
+
+	/// Notification timestamp is too old or too far in the future.
+	///
+	/// LSPS5 requires timestamps to be within ±10 minutes of current time.
+	/// The string contains the problematic timestamp.
+	InvalidTimestamp(String),
+
+	/// Failed to serialize an object to JSON.
+	///
+	/// The string contains the detailed error message.
+	SerializeError(String),
+
+	/// Failed to deserialize JSON into an expected object.
+	///
+	/// The string contains the detailed error message.
+	DeserializeError(String),
+
+	/// Detected a reused notification signature.
+	///
+	/// Indicates a potential replay attack where a previously seen
+	/// notification signature was reused.
+	ReplayAttack,
+}
+
+impl LSPS5ClientError {
+	const BASE: i32 = 100_000;
+	/// The error code for the client error.
 	pub fn code(&self) -> i32 {
+		use LSPS5ClientError::*;
 		match self {
-			LSPS5Error::TooLong(_) => LSPS5_TOO_LONG_ERROR_CODE,
-			LSPS5Error::UrlParse(_) => LSPS5_URL_PARSE_ERROR_CODE,
-			LSPS5Error::UnsupportedProtocol(_) => LSPS5_UNSUPPORTED_PROTOCOL_ERROR_CODE,
-			LSPS5Error::TooManyWebhooks(_) => LSPS5_TOO_MANY_WEBHOOKS_ERROR_CODE,
-			LSPS5Error::AppNameNotFound(_) => LSPS5_APP_NAME_NOT_FOUND_ERROR_CODE,
-			LSPS5Error::Other { code, .. } => *code,
+			InvalidSignature => Self::BASE + 1,
+			InvalidTimestamp(_) => Self::BASE + 2,
+			SerializeError(_) => Self::BASE + 3,
+			DeserializeError(_) => Self::BASE + 4,
+			ReplayAttack => Self::BASE + 5,
 		}
 	}
-	/// Human‐readable message
+	/// The error message for the client error.
 	pub fn message(&self) -> String {
+		use LSPS5ClientError::*;
 		match self {
-			LSPS5Error::TooLong(m)
-			| LSPS5Error::UrlParse(m)
-			| LSPS5Error::UnsupportedProtocol(m)
-			| LSPS5Error::TooManyWebhooks(m)
-			| LSPS5Error::AppNameNotFound(m) => m.clone(),
-			LSPS5Error::Other { message, .. } => message.clone(),
+			InvalidSignature => "Invalid signature".into(),
+			InvalidTimestamp(m) => format!("Timestamp out of range: {}", m),
+			SerializeError(m) => format!("Serialization error: {}", m),
+			DeserializeError(m) => format!("Deserialization error: {}", m),
+			ReplayAttack => "Replay attack detected".into(),
 		}
 	}
 }
 
-/// Convert LSPSResponseError to LSPS5Error
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Combined error type for LSPS5 client and protocol errors.
+///
+/// This enum wraps both specification-defined protocol errors and
+/// client-side processing errors into a single error type for use
+/// throughout the LSPS5 implementation.
+pub enum LSPS5Error {
+	/// An error defined in the LSPS5 specification.
+	///
+	/// This represents errors that are part of the formal protocol.
+	Protocol(LSPS5ProtocolError),
+
+	/// A client-side processing error.
+	///
+	/// This represents errors that occur during client-side handling
+	/// of notifications or other validation.
+	Client(LSPS5ClientError),
+}
+
+impl From<LSPS5ProtocolError> for LSPS5Error {
+	fn from(e: LSPS5ProtocolError) -> Self {
+		LSPS5Error::Protocol(e)
+	}
+}
+impl From<LSPS5ClientError> for LSPS5Error {
+	fn from(e: LSPS5ClientError) -> Self {
+		LSPS5Error::Client(e)
+	}
+}
+
 impl From<LSPSResponseError> for LSPS5Error {
 	fn from(err: LSPSResponseError) -> Self {
+		LSPS5ProtocolError::from(err).into()
+	}
+}
+
+impl From<LSPSResponseError> for LSPS5ProtocolError {
+	fn from(err: LSPSResponseError) -> Self {
 		match err.code {
-			LSPS5_TOO_LONG_ERROR_CODE => LSPS5Error::TooLong(err.message),
-			LSPS5_URL_PARSE_ERROR_CODE => LSPS5Error::UrlParse(err.message),
-			LSPS5_UNSUPPORTED_PROTOCOL_ERROR_CODE => LSPS5Error::UnsupportedProtocol(err.message),
-			LSPS5_TOO_MANY_WEBHOOKS_ERROR_CODE => LSPS5Error::TooManyWebhooks(err.message),
-			LSPS5_APP_NAME_NOT_FOUND_ERROR_CODE => LSPS5Error::AppNameNotFound(err.message),
-			code => LSPS5Error::Other { code, message: err.message },
+			LSPS5_TOO_LONG_ERROR_CODE => LSPS5ProtocolError::AppNameTooLong,
+			LSPS5_URL_PARSE_ERROR_CODE => LSPS5ProtocolError::UrlParse(err.message),
+			LSPS5_UNSUPPORTED_PROTOCOL_ERROR_CODE => LSPS5ProtocolError::UnsupportedProtocol,
+			LSPS5_TOO_MANY_WEBHOOKS_ERROR_CODE => match err.data {
+				Some(d) => LSPS5ProtocolError::TooManyWebhooks(d),
+				None => LSPS5ProtocolError::UnknownError,
+			},
+			LSPS5_APP_NAME_NOT_FOUND_ERROR_CODE => LSPS5ProtocolError::AppNameNotFound,
+			_ => LSPS5ProtocolError::UnknownError,
 		}
 	}
 }
 
-/// Convert LSPS5Error to LSPSResponseError.
+impl From<LSPS5ProtocolError> for LSPSResponseError {
+	fn from(e: LSPS5ProtocolError) -> Self {
+		LSPSResponseError {
+			code: e.code(),
+			message: e.message(),
+			data: match e {
+				LSPS5ProtocolError::TooManyWebhooks(max) => Some(max.to_string()),
+				_ => None,
+			},
+		}
+	}
+}
+
 impl From<LSPS5Error> for LSPSResponseError {
-	fn from(err: LSPS5Error) -> Self {
-		LSPSResponseError { code: err.code(), message: err.message(), data: None }
+	fn from(e: LSPS5Error) -> Self {
+		match e {
+			LSPS5Error::Protocol(p) => p.into(),
+			LSPS5Error::Client(c) => {
+				LSPSResponseError { code: c.code(), message: c.message(), data: None }
+			},
+		}
 	}
 }
 
@@ -140,10 +300,7 @@ impl LSPS5AppName {
 	/// Create a new LSPS5 app name.
 	pub fn new(app_name: UntrustedString) -> Result<Self, LSPS5Error> {
 		if app_name.to_string().chars().count() > MAX_APP_NAME_LENGTH {
-			return Err(LSPS5Error::TooLong(format!(
-				"App name exceeds maximum length of {} bytes",
-				MAX_APP_NAME_LENGTH
-			)));
+			return Err(LSPS5ProtocolError::AppNameTooLong.into());
 		}
 		Ok(Self(app_name))
 	}
@@ -212,20 +369,18 @@ impl LSPS5WebhookUrl {
 	/// Create a new LSPS5 webhook URL.
 	pub fn new(url: UntrustedString) -> Result<Self, LSPS5Error> {
 		let parsed_url = LSPSUrl::parse(url.0.clone())
-			.map_err(|_e| LSPS5Error::UrlParse(format!("Error parsing URL: {:?}", url)))?;
+			.map_err(|_e| LSPS5ProtocolError::UrlParse("Error parsing URL".to_string()))?;
 		if parsed_url.url_length() > MAX_WEBHOOK_URL_LENGTH {
-			return Err(LSPS5Error::TooLong(format!(
-				"Webhook URL exceeds maximum length of {} bytes",
-				MAX_WEBHOOK_URL_LENGTH
-			)));
+			return Err(LSPS5ProtocolError::WebhookUrlTooLong.into());
 		}
 		if !parsed_url.is_https() {
-			return Err(LSPS5Error::UnsupportedProtocol(
-				"Unsupported protocol: HTTPS is required".to_string(),
-			));
+			return Err(LSPS5ProtocolError::UnsupportedProtocol.into());
 		}
 		if !parsed_url.is_public() {
-			return Err(LSPS5Error::UrlParse("Webhook URL must be a public URL".to_string()));
+			return Err(LSPS5ProtocolError::UrlParse(
+				"Webhook URL must be a public URL".to_string(),
+			)
+			.into());
 		}
 		Ok(Self(parsed_url))
 	}
@@ -515,15 +670,15 @@ pub enum LSPS5Response {
 	/// Response to [`SetWebhook`](SetWebhookRequest) request.
 	SetWebhook(SetWebhookResponse),
 	/// Error response to [`SetWebhook`](SetWebhookRequest) request.
-	SetWebhookError(LSPS5Error),
+	SetWebhookError(LSPSResponseError),
 	/// Response to [`ListWebhooks`](ListWebhooksRequest) request.
 	ListWebhooks(ListWebhooksResponse),
 	/// Error response to [`ListWebhooks`](ListWebhooksRequest) request.
-	ListWebhooksError(LSPS5Error),
+	ListWebhooksError(LSPSResponseError),
 	/// Response to [`RemoveWebhook`](RemoveWebhookRequest) request.
 	RemoveWebhook(RemoveWebhookResponse),
 	/// Error response to [`RemoveWebhook`](RemoveWebhookRequest) request.
-	RemoveWebhookError(LSPS5Error),
+	RemoveWebhookError(LSPSResponseError),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -705,8 +860,15 @@ mod tests {
 			match LSPS5WebhookUrl::new(UntrustedString(url_str.to_string())) {
 				Ok(_) => panic!("Expected error"),
 				Err(e) => {
-					// error is not null
-					assert!(e.code() != 0);
+					let protocol_error = match e {
+						LSPS5Error::Protocol(err) => err,
+						_ => panic!("Expected protocol error"),
+					};
+					let code = protocol_error.code();
+					assert!(
+						code == LSPS5_UNSUPPORTED_PROTOCOL_ERROR_CODE
+							|| code == LSPS5_URL_PARSE_ERROR_CODE
+					);
 				},
 			}
 		}
@@ -776,6 +938,47 @@ mod tests {
 				} else {
 					panic!("Expected LSPS5ExpirySoon after deserialization");
 				}
+			}
+		}
+	}
+
+	#[test]
+	fn test_all_notification_methods_from_spec() {
+		let methods = [
+			("lsps5.webhook_registered", WebhookNotificationMethod::LSPS5WebhookRegistered, "{}"),
+			("lsps5.payment_incoming", WebhookNotificationMethod::LSPS5PaymentIncoming, "{}"),
+			(
+				"lsps5.expiry_soon",
+				WebhookNotificationMethod::LSPS5ExpirySoon { timeout: 144 },
+				"{\"timeout\":144}",
+			),
+			(
+				"lsps5.liquidity_management_request",
+				WebhookNotificationMethod::LSPS5LiquidityManagementRequest,
+				"{}",
+			),
+			(
+				"lsps5.onion_message_incoming",
+				WebhookNotificationMethod::LSPS5OnionMessageIncoming,
+				"{}",
+			),
+		];
+
+		for (method_name, method_enum, params_json) in methods {
+			let json = format!(
+				r#"{{"jsonrpc":"2.0","method":"{}","params":{}}}"#,
+				method_name, params_json
+			);
+
+			let notification: WebhookNotification = serde_json::from_str(&json).unwrap();
+
+			assert_eq!(notification.method, method_enum);
+
+			let serialized = serde_json::to_string(&notification).unwrap();
+			assert!(serialized.contains(&format!("\"method\":\"{}\"", method_name)));
+
+			if method_name == "lsps5.expiry_soon" {
+				assert!(serialized.contains("\"timeout\":144"));
 			}
 		}
 	}
