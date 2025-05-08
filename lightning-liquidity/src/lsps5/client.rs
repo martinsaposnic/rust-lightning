@@ -22,18 +22,18 @@ use crate::prelude::{new_hash_map, HashMap};
 use crate::sync::{Arc, Mutex, RwLock};
 use crate::utils::generate_request_id;
 
-use super::msgs::{LSPS5AppName, LSPS5WebhookUrl};
-#[cfg(feature = "time")]
-use super::service::DefaultTimeProvider;
+use super::msgs::{LSPS5AppName, LSPS5ClientError, LSPS5Error, LSPS5WebhookUrl};
 use super::service::TimeProvider;
 
-use alloc::collections::VecDeque;
-use alloc::string::String;
 use bitcoin::secp256k1::PublicKey;
+
 use lightning::ln::msgs::{ErrorAction, LightningError};
 use lightning::sign::EntropySource;
 use lightning::util::logger::Level;
 use lightning::util::message_signing;
+
+use alloc::collections::VecDeque;
+use alloc::string::String;
 
 use core::ops::Deref;
 use core::time::Duration;
@@ -65,7 +65,7 @@ impl Default for SignatureStorageConfig {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 /// Configuration for the LSPS5 client
 pub struct LSPS5ClientConfig {
 	/// Maximum age in seconds for cached responses (default: 3600 - 1 hour).
@@ -85,9 +85,9 @@ impl Default for LSPS5ClientConfig {
 
 struct PeerState {
 	pending_set_webhook_requests:
-		HashMap<LSPSRequestId, (LSPS5AppName, LSPS5WebhookUrl, LSPSDateTime)>, // RequestId -> (app_name, webhook_url, timestamp)
-	pending_list_webhooks_requests: HashMap<LSPSRequestId, LSPSDateTime>, // RequestId -> timestamp
-	pending_remove_webhook_requests: HashMap<LSPSRequestId, (LSPS5AppName, LSPSDateTime)>, // RequestId -> (app_name, timestamp)
+		HashMap<LSPSRequestId, (LSPS5AppName, LSPS5WebhookUrl, LSPSDateTime)>,
+	pending_list_webhooks_requests: HashMap<LSPSRequestId, LSPSDateTime>,
+	pending_remove_webhook_requests: HashMap<LSPSRequestId, (LSPS5AppName, LSPSDateTime)>,
 	last_cleanup: Option<LSPSDateTime>,
 	max_age_secs: Duration,
 	time_provider: Arc<dyn TimeProvider>,
@@ -129,24 +129,33 @@ impl PeerState {
 	}
 }
 
-/// LSPS5 client handler.
+/// Client‐side handler for the LSPS5 (bLIP-55) webhook registration protocol.
+///
+/// `LSPS5ClientHandler` is the primary interface for LSP clients
+/// to register, list, and remove webhook endpoints with an LSP, and to parse
+/// and validate incoming signed notifications.
+///
+/// # Core Capabilities
+///
+///  - `set_webhook(peer, app_name, url)` -> register or update a webhook [`lsps5.set_webhook`]
+///  - `list_webhooks(peer)` -> retrieve all registered webhooks [`lsps5.list_webhooks`]
+///  - `remove_webhook(peer, name)` -> delete a webhook [`lsps5.remove_webhook`]
+///  - `parse_webhook_notification(...)` -> verify signature, timestamp, replay, and emit event
+///
+/// [`bLIP-55 / LSPS5 specification`]: https://github.com/lightning/blips/pull/55/files
+/// [`lsps5.set_webhook`]: super::msgs::LSPS5Request::SetWebhook
+/// [`lsps5.list_webhooks`]: super::msgs::LSPS5Request::ListWebhooks
+/// [`lsps5.remove_webhook`]: super::msgs::LSPS5Request::RemoveWebhook
 pub struct LSPS5ClientHandler<ES: Deref>
 where
 	ES::Target: EntropySource,
 {
-	/// Pending messages to be sent.
 	pending_messages: Arc<MessageQueue>,
-	/// Event queue for emitting events.
 	pending_events: Arc<EventQueue>,
-	/// Entropy source.
 	entropy_source: ES,
-	/// Per peer state for tracking requests.
 	per_peer_state: RwLock<HashMap<PublicKey, Mutex<PeerState>>>,
-	/// Client configuration.
 	config: LSPS5ClientConfig,
-	/// Time provider for LSPS5 service.
 	time_provider: Arc<dyn TimeProvider>,
-	/// Map of recently used signatures to prevent replay attacks.
 	recent_signatures: Mutex<VecDeque<(String, LSPSDateTime)>>,
 }
 
@@ -154,24 +163,8 @@ impl<ES: Deref> LSPS5ClientHandler<ES>
 where
 	ES::Target: EntropySource,
 {
-	/// Creates a new LSPS5 client handler with the provided entropy source, message queue,
-	/// event queue, and LSPS5ClientConfig.
-	#[cfg(feature = "time")]
+	/// Constructs an `LSPS5ClientHandler`.
 	pub(crate) fn new(
-		entropy_source: ES, pending_messages: Arc<MessageQueue>, pending_events: Arc<EventQueue>,
-		config: LSPS5ClientConfig,
-	) -> Self {
-		let time_provider = Arc::new(DefaultTimeProvider);
-		Self::new_with_custom_time_provider(
-			entropy_source,
-			pending_messages,
-			pending_events,
-			config,
-			time_provider,
-		)
-	}
-
-	pub(crate) fn new_with_custom_time_provider(
 		entropy_source: ES, pending_messages: Arc<MessageQueue>, pending_events: Arc<EventQueue>,
 		config: LSPS5ClientConfig, time_provider: Arc<dyn TimeProvider>,
 	) -> Self {
@@ -187,9 +180,7 @@ where
 		}
 	}
 
-	fn with_peer_state<F, R>(
-		&self, counterparty_node_id: PublicKey, f: F,
-	) -> Result<R, LightningError>
+	fn with_peer_state<F, R>(&self, counterparty_node_id: PublicKey, f: F) -> R
 	where
 		F: FnOnce(&mut PeerState) -> R,
 	{
@@ -201,34 +192,41 @@ where
 
 		peer_state_lock.cleanup_expired_responses();
 
-		Ok(f(&mut *peer_state_lock))
+		f(&mut *peer_state_lock)
 	}
 
-	/// Register a webhook with the LSP.
+	/// Register or update a webhook endpoint under a human-readable name.
 	///
-	/// Implements the `lsps5.set_webhook` method from bLIP-55.
+	/// Sends a `lsps5.set_webhook` JSON-RPC request to the given LSP peer.
 	///
 	/// # Parameters
-	/// * `app_name` - A human-readable UTF-8 string that gives a name to the webhook (max 64 bytes).
-	/// * `webhook` - The URL of the webhook that the LSP can use to push notifications (max 1024 chars).
+	/// - `counterparty_node_id`: The LSP node ID to contact.
+	/// - `app_name`: A UTF-8 name for this webhook.
+	/// - `webhook_url`: HTTPS URL for push notifications.
 	///
 	/// # Returns
-	/// * Success - the request ID that was used.
-	/// * Error - validation error or error sending the request.
+	/// A unique `LSPSRequestId` for correlating the asynchronous response.
 	///
-	/// Response will be provided asynchronously through the event queue as a
-	/// WebhookRegistered or WebhookRegistrationFailed event.
+	/// Response from the LSP peer will be provided asynchronously through a
+	/// [`LSPS5Response::SetWebhook`] or [`LSPS5Response::SetWebhookError`] message, and this client
+	/// will then enqueue either a [`WebhookRegistered`] or [`WebhookRegistrationFailed`] event.
+	///
+	/// **Note**: Ensure the app name is valid and its length does not exceed [`MAX_APP_NAME_LENGTH`].
+	/// Also ensure the URL is valid, has HTTPS protocol, its length does not exceed [`MAX_WEBHOOK_URL_LENGTH`]
+	/// and that the URL points to a public host.
+	///
+	/// [`MAX_WEBHOOK_URL_LENGTH`]: super::msgs::MAX_WEBHOOK_URL_LENGTH
+	/// [`MAX_APP_NAME_LENGTH`]: super::msgs::MAX_APP_NAME_LENGTH
+	/// [`WebhookRegistered`]: super::event::LSPS5ClientEvent::WebhookRegistered
+	/// [`WebhookRegistrationFailed`]: super::event::LSPS5ClientEvent::WebhookRegistrationFailed
+	/// [`LSPS5Response::SetWebhook`]: super::msgs::LSPS5Response::SetWebhook
+	/// [`LSPS5Response::SetWebhookError`]: super::msgs::LSPS5Response::SetWebhookError
 	pub fn set_webhook(
 		&self, counterparty_node_id: PublicKey, app_name: String, webhook_url: String,
-	) -> Result<LSPSRequestId, LightningError> {
-		let app_name = LSPS5AppName::from_string(app_name).map_err(|e| LightningError {
-			err: e.message(),
-			action: ErrorAction::IgnoreAndLog(Level::Error),
-		})?;
+	) -> Result<LSPSRequestId, LSPS5Error> {
+		let app_name = LSPS5AppName::from_string(app_name)?;
 
-		let lsps_webhook_url = LSPS5WebhookUrl::from_string(webhook_url).map_err(|e| {
-			LightningError { err: e.message(), action: ErrorAction::IgnoreAndLog(Level::Error) }
-		})?;
+		let lsps_webhook_url = LSPS5WebhookUrl::from_string(webhook_url)?;
 
 		let request_id = generate_request_id(&self.entropy_source);
 
@@ -243,7 +241,7 @@ where
 					),
 				),
 			);
-		})?;
+		});
 
 		let request =
 			LSPS5Request::SetWebhook(SetWebhookRequest { app_name, webhook: lsps_webhook_url });
@@ -254,54 +252,63 @@ where
 		Ok(request_id)
 	}
 
-	/// List all registered webhooks.
+	/// List all webhook names currently registered with the LSP.
 	///
-	/// Implements the `lsps5.list_webhooks` method from bLIP-55.
+	/// Sends a `lsps5.list_webhooks` JSON-RPC request to the peer.
+	///
+	/// # Parameters
+	/// - `counterparty_node_id`: The LSP node ID to query.
 	///
 	/// # Returns
-	/// * Success - the request ID that was used.
-	/// * Error - error sending the request.
+	/// A unique `LSPSRequestId` for correlating the asynchronous response.
 	///
-	/// Response will be provided asynchronously through the event queue as a
-	/// WebhooksListed or WebhooksListFailed event.
-	pub fn list_webhooks(
-		&self, counterparty_node_id: PublicKey,
-	) -> Result<LSPSRequestId, LightningError> {
+	/// Response from the LSP peer will be provided asynchronously through a
+	/// [`LSPS5Response::ListWebhooks`] or [`LSPS5Response::ListWebhooksError`] message, and this client
+	/// will then enqueue either a [`WebhooksListed`] or [`WebhooksListFailed`] event.
+	///
+	/// [`WebhooksListed`]: super::event::LSPS5ClientEvent::WebhooksListed
+	/// [`WebhooksListFailed`]: super::event::LSPS5ClientEvent::WebhooksListFailed
+	/// [`LSPS5Response::ListWebhooks`]: super::msgs::LSPS5Response::ListWebhooks
+	/// [`LSPS5Response::ListWebhooksError`]: super::msgs::LSPS5Response::ListWebhooksError
+	pub fn list_webhooks(&self, counterparty_node_id: PublicKey) -> LSPSRequestId {
 		let request_id = generate_request_id(&self.entropy_source);
 		let now =
 			LSPSDateTime::new_from_duration_since_epoch(self.time_provider.duration_since_epoch());
 
 		self.with_peer_state(counterparty_node_id, |peer_state| {
 			peer_state.pending_list_webhooks_requests.insert(request_id.clone(), now);
-		})?;
+		});
 
 		let request = LSPS5Request::ListWebhooks(ListWebhooksRequest {});
 		let message = LSPS5Message::Request(request_id.clone(), request);
 		self.pending_messages.enqueue(&counterparty_node_id, LSPSMessage::LSPS5(message));
 
-		Ok(request_id)
+		request_id
 	}
 
-	/// Remove a webhook by app_name.
+	/// Remove a previously registered webhook by its name.
 	///
-	/// Implements the `lsps5.remove_webhook` method from bLIP-55.
+	/// Sends a `lsps5.remove_webhook` JSON-RPC request to the peer.
 	///
 	/// # Parameters
-	/// * `app_name` - The name of the webhook to remove.
+	/// - `counterparty_node_id`: The LSP node ID to contact.
+	/// - `app_name`: The name of the webhook to remove.
 	///
 	/// # Returns
-	/// * Success - the request ID that was used.
-	/// * Error - error sending the request.
+	/// A unique `LSPSRequestId` for correlating the asynchronous response.
 	///
-	/// Response will be provided asynchronously through the event queue as a
-	/// WebhookRemoved or WebhookRemovalFailed event.
+	/// Response from the LSP peer will be provided asynchronously through a
+	/// [`LSPS5Response::RemoveWebhook`] or [`LSPS5Response::RemoveWebhookError`] message, and this client
+	/// will then enqueue either a [`WebhookRemoved`] or [`WebhookRemovalFailed`] event.
+	///
+	/// [`WebhookRemoved`]: super::event::LSPS5ClientEvent::WebhookRemoved
+	/// [`WebhookRemovalFailed`]: super::event::LSPS5ClientEvent::WebhookRemovalFailed
+	/// [`LSPS5Response::RemoveWebhook`]: super::msgs::LSPS5Response::RemoveWebhook
+	/// [`LSPS5Response::RemoveWebhookError`]: super::msgs::LSPS5Response::RemoveWebhookError
 	pub fn remove_webhook(
 		&self, counterparty_node_id: PublicKey, app_name: String,
-	) -> Result<LSPSRequestId, LightningError> {
-		let app_name = LSPS5AppName::from_string(app_name).map_err(|e| LightningError {
-			err: e.message(),
-			action: ErrorAction::IgnoreAndLog(Level::Error),
-		})?;
+	) -> Result<LSPSRequestId, LSPS5Error> {
+		let app_name = LSPS5AppName::from_string(app_name)?;
 
 		let request_id = generate_request_id(&self.entropy_source);
 		let now =
@@ -311,7 +318,7 @@ where
 			peer_state
 				.pending_remove_webhook_requests
 				.insert(request_id.clone(), (app_name.clone(), now));
-		})?;
+		});
 
 		let request = LSPS5Request::RemoveWebhook(RemoveWebhookRequest { app_name });
 		let message = LSPS5Message::Request(request_id.clone(), request);
@@ -320,216 +327,163 @@ where
 		Ok(request_id)
 	}
 
-	/// Handle received messages from the LSP.
 	fn handle_message(
 		&self, message: LSPS5Message, counterparty_node_id: &PublicKey,
 	) -> Result<(), LightningError> {
-		let event_queue_notifier = self.pending_events.notifier();
-		match message {
-			LSPS5Message::Response(request_id, response) => {
-				let mut result = Err(LightningError {
-					err: format!(
-						"Received LSPS5 response from unknown peer: {}",
-						counterparty_node_id
-					),
-					action: ErrorAction::IgnoreAndLog(Level::Error),
-				});
-
-				self.with_peer_state(*counterparty_node_id, |peer_state| {
-					if let Some((app_name, webhook_url, _)) =
-						peer_state.pending_set_webhook_requests.remove(&request_id)
-					{
-						match response {
-							LSPS5Response::SetWebhook(response) => {
-								event_queue_notifier.enqueue(LSPS5ClientEvent::WebhookRegistered {
-									counterparty_node_id: *counterparty_node_id,
-									num_webhooks: response.num_webhooks,
-									max_webhooks: response.max_webhooks,
-									no_change: response.no_change,
-									app_name,
-									url: webhook_url,
-									request_id,
-								});
-								result = Ok(());
-							},
-							LSPS5Response::SetWebhookError(error) => {
-								event_queue_notifier.enqueue(
-									LSPS5ClientEvent::WebhookRegistrationFailed {
-										counterparty_node_id: *counterparty_node_id,
-										error,
-										app_name,
-										url: webhook_url,
-										request_id,
-									},
-								);
-								result = Ok(());
-							},
-							_ => {
-								result = Err(LightningError {
-									err: "Unexpected response type for SetWebhook request"
-										.to_string(),
-									action: ErrorAction::IgnoreAndLog(Level::Error),
-								});
-							},
-						}
-					} else if peer_state
-						.pending_list_webhooks_requests
-						.remove(&request_id)
-						.is_some()
-					{
-						match response {
-							LSPS5Response::ListWebhooks(response) => {
-								event_queue_notifier.enqueue(LSPS5ClientEvent::WebhooksListed {
-									counterparty_node_id: *counterparty_node_id,
-									app_names: response.app_names,
-									max_webhooks: response.max_webhooks,
-									request_id,
-								});
-								result = Ok(());
-							},
-							LSPS5Response::ListWebhooksError(error) => {
-								event_queue_notifier.enqueue(
-									LSPS5ClientEvent::WebhooksListFailed {
-										counterparty_node_id: *counterparty_node_id,
-										error,
-										request_id,
-									},
-								);
-								result = Ok(());
-							},
-							_ => {
-								result = Err(LightningError {
-									err: "Unexpected response type for ListWebhooks request"
-										.to_string(),
-									action: ErrorAction::IgnoreAndLog(Level::Error),
-								});
-							},
-						}
-					} else if let Some((app_name, _)) =
-						peer_state.pending_remove_webhook_requests.remove(&request_id)
-					{
-						match response {
-							LSPS5Response::RemoveWebhook(_) => {
-								event_queue_notifier.enqueue(LSPS5ClientEvent::WebhookRemoved {
-									counterparty_node_id: *counterparty_node_id,
-									app_name,
-									request_id,
-								});
-								result = Ok(());
-							},
-							LSPS5Response::RemoveWebhookError(error) => {
-								event_queue_notifier.enqueue(
-									LSPS5ClientEvent::WebhookRemovalFailed {
-										counterparty_node_id: *counterparty_node_id,
-										error,
-										app_name,
-										request_id,
-									},
-								);
-								result = Ok(());
-							},
-							_ => {
-								result = Err(LightningError {
-									err: "Unexpected response type for RemoveWebhook request"
-										.to_string(),
-									action: ErrorAction::IgnoreAndLog(Level::Error),
-								});
-							},
-						}
-					} else {
-						result = Err(LightningError {
-							err: format!(
-								"Received response for unknown request ID: {}",
-								request_id.0
-							),
-							action: ErrorAction::IgnoreAndLog(Level::Info),
-						});
-					}
-				})?;
-
-				result
-			},
+		let (request_id, response) = match message {
 			LSPS5Message::Request(_, _) => {
-				// We're a client, so we don't expect to receive requests
-				Err(LightningError {
+				return Err(LightningError {
 					err: format!(
 						"Received unexpected request message from {}",
 						counterparty_node_id
 					),
 					action: ErrorAction::IgnoreAndLog(Level::Info),
-				})
+				});
 			},
-		}
+			LSPS5Message::Response(rid, resp) => (rid, resp),
+		};
+		let mut result: Result<(), LightningError> = Err(LightningError {
+			err: format!("Received LSPS5 response from unknown peer: {}", counterparty_node_id),
+			action: ErrorAction::IgnoreAndLog(Level::Error),
+		});
+		let event_queue_notifier = self.pending_events.notifier();
+		let handle_response = |peer_state: &mut PeerState| {
+			if let Some((app_name, webhook_url, _)) =
+				peer_state.pending_set_webhook_requests.remove(&request_id)
+			{
+				match &response {
+					LSPS5Response::SetWebhook(r) => {
+						event_queue_notifier.enqueue(LSPS5ClientEvent::WebhookRegistered {
+							counterparty_node_id: *counterparty_node_id,
+							num_webhooks: r.num_webhooks,
+							max_webhooks: r.max_webhooks,
+							no_change: r.no_change,
+							app_name,
+							url: webhook_url,
+							request_id,
+						});
+						result = Ok(());
+					},
+					LSPS5Response::SetWebhookError(e) => {
+						event_queue_notifier.enqueue(LSPS5ClientEvent::WebhookRegistrationFailed {
+							counterparty_node_id: *counterparty_node_id,
+							error: e.clone().into(),
+							app_name,
+							url: webhook_url,
+							request_id,
+						});
+						result = Ok(());
+					},
+					_ => {
+						result = Err(LightningError {
+							err: "Unexpected response type for SetWebhook".to_string(),
+							action: ErrorAction::IgnoreAndLog(Level::Error),
+						});
+					},
+				}
+			} else if peer_state.pending_list_webhooks_requests.remove(&request_id).is_some() {
+				match &response {
+					LSPS5Response::ListWebhooks(r) => {
+						event_queue_notifier.enqueue(LSPS5ClientEvent::WebhooksListed {
+							counterparty_node_id: *counterparty_node_id,
+							app_names: r.app_names.clone(),
+							max_webhooks: r.max_webhooks,
+							request_id,
+						});
+						result = Ok(());
+					},
+					LSPS5Response::ListWebhooksError(e) => {
+						event_queue_notifier.enqueue(LSPS5ClientEvent::WebhooksListFailed {
+							counterparty_node_id: *counterparty_node_id,
+							error: e.clone().into(),
+							request_id,
+						});
+						result = Ok(());
+					},
+					_ => {
+						result = Err(LightningError {
+							err: "Unexpected response type for ListWebhooks".to_string(),
+							action: ErrorAction::IgnoreAndLog(Level::Error),
+						});
+					},
+				}
+			} else if let Some((app_name, _)) =
+				peer_state.pending_remove_webhook_requests.remove(&request_id)
+			{
+				match &response {
+					LSPS5Response::RemoveWebhook(_) => {
+						event_queue_notifier.enqueue(LSPS5ClientEvent::WebhookRemoved {
+							counterparty_node_id: *counterparty_node_id,
+							app_name,
+							request_id,
+						});
+						result = Ok(());
+					},
+					LSPS5Response::RemoveWebhookError(e) => {
+						event_queue_notifier.enqueue(LSPS5ClientEvent::WebhookRemovalFailed {
+							counterparty_node_id: *counterparty_node_id,
+							error: e.clone().into(),
+							app_name,
+							request_id,
+						});
+						result = Ok(());
+					},
+					_ => {
+						result = Err(LightningError {
+							err: "Unexpected response type for RemoveWebhook".to_string(),
+							action: ErrorAction::IgnoreAndLog(Level::Error),
+						});
+					},
+				}
+			} else {
+				result = Err(LightningError {
+					err: format!("Received response for unknown request ID: {}", request_id.0),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				});
+			}
+		};
+		self.with_peer_state(*counterparty_node_id, handle_response);
+		result
 	}
 
-	/// Verify a webhook notification signature from an LSP.
-	///
-	/// This can be used by a notification delivery service to verify
-	/// the authenticity of notifications received from an LSP.
-	///
-	/// # Parameters
-	/// * `timestamp` - The ISO8601 timestamp from the notification.
-	/// * `signature` - The signature string from the notification.
-	/// * `notification` - The webhook notification object.
-	///
-	/// # Returns
-	/// * On success: `true` if the signature is valid.
-	/// * On error: LightningError with error description.
-	pub fn verify_notification_signature(
+	fn verify_notification_signature(
 		&self, counterparty_node_id: PublicKey, signature_timestamp: &LSPSDateTime,
 		signature: &str, notification: &WebhookNotification,
-	) -> Result<bool, LightningError> {
+	) -> Result<bool, LSPS5ClientError> {
 		let now =
 			LSPSDateTime::new_from_duration_since_epoch(self.time_provider.duration_since_epoch());
 		let diff = signature_timestamp.abs_diff(now);
-
-		if diff > 600 {
-			return Err(LightningError {
-				err: format!("Timestamp too old: {}", signature_timestamp),
-				action: ErrorAction::IgnoreAndLog(Level::Error),
-			});
+		let ten_minutes = 600;
+		if diff > ten_minutes {
+			return Err(LSPS5ClientError::InvalidTimestamp(signature_timestamp.to_rfc3339()));
 		}
 
-		let notification_json =
-			serde_json::to_string(notification).map_err(|e| LightningError {
-				err: format!("Failed to serialize notification: {}", e),
-				action: ErrorAction::IgnoreAndLog(Level::Error),
-			})?;
-
 		let message = format!(
-			"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {}",
+			"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {:?}",
 			signature_timestamp.to_rfc3339(),
-			notification_json
+			notification
 		);
 
 		if message_signing::verify(message.as_bytes(), signature, &counterparty_node_id) {
 			Ok(true)
 		} else {
-			Err(LightningError {
-				err: "Invalid signature".to_string(),
-				action: ErrorAction::IgnoreAndLog(Level::Error),
-			})
+			Err(LSPS5ClientError::InvalidSignature)
 		}
 	}
 
-	/// Check if a signature has been used before.
-	fn check_signature_exists(&self, signature: &str) -> Result<(), LightningError> {
+	fn check_signature_exists(&self, signature: &str) -> Result<(), LSPS5ClientError> {
 		let recent_signatures = self.recent_signatures.lock().unwrap();
 
 		for (stored_sig, _) in recent_signatures.iter() {
 			if stored_sig == signature {
-				return Err(LightningError {
-					err: "Replay attack detected: signature has been used before".to_string(),
-					action: ErrorAction::IgnoreAndLog(Level::Warn),
-				});
+				return Err(LSPS5ClientError::ReplayAttack);
 			}
 		}
 
 		Ok(())
 	}
 
-	/// Store a signature with timestamp for replay attack prevention.
-	fn store_signature(&self, signature: String) -> Result<(), LightningError> {
+	fn store_signature(&self, signature: String) {
 		let now =
 			LSPSDateTime::new_from_duration_since_epoch(self.time_provider.duration_since_epoch());
 		let mut recent_signatures = self.recent_signatures.lock().unwrap();
@@ -548,39 +502,43 @@ where
 		while recent_signatures.len() > self.config.signature_config.max_signatures {
 			recent_signatures.pop_front();
 		}
-
-		Ok(())
 	}
 
-	/// Parse a webhook notification received from an LSP.
+	/// Parse and validate a webhook notification received from an LSP.
 	///
-	/// This can be used by a client implementation to handle webhook
-	/// notifications after they're delivered through a push notification
-	/// system.
+	/// Implements the bLIP-55 / LSPS5 webhook delivery rules:
+	/// 1. Parses `notification_json` into a `WebhookNotification` (JSON-RPC 2.0).
+	/// 2. Checks that `timestamp` (from `x-lsps5-timestamp`) is within ±10 minutes of local time.
+	/// 3. Ensures `signature` (from `x-lsps5-signature`) has not been replayed within the
+	///    configured retention window.
+	/// 4. Reconstructs the exact string
+	///    `"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {timestamp} I notify {body}"`
+	///    and verifies the zbase32 LN-style signature against the LSP’s node ID.
 	///
 	/// # Parameters
-	/// * `timestamp` - The ISO8601 timestamp from the notification.
-	/// * `signature` - The signature from the notification.
-	/// * `notification_json` - The JSON string of the notification object.
+	/// - `counterparty_node_id`: the LSP’s public key, used to verify the signature.
+	/// - `timestamp`: ISO8601 time when the LSP created the notification.
+	/// - `signature`: the zbase32-encoded LN signature over timestamp+body.
+	/// - `notification`: the [`WebhookNotification`] received from the LSP.
 	///
-	/// # Returns
-	/// * On success: The parsed webhook notification.
-	/// * On error: LightningError with error description.
+	/// On success, emits [`LSPS5ClientEvent::WebhookNotificationReceived`].
+	///
+	/// Failure reasons include:
+	/// - Timestamp too old (drift > 10 minutes)
+	/// - Replay attack detected (signature reused)
+	/// - Invalid signature (crypto check fails)
+	///
+	/// Clients should call this method upon receiving a [`LSPS5ServiceEvent::SendWebhookNotification`]
+	/// event, before taking action on the notification. This guarantees that only authentic,
+	/// non-replayed notifications reach your application.
+	///
+	/// [`LSPS5ClientEvent::WebhookNotificationReceived`]: super::event::LSPS5ClientEvent::WebhookNotificationReceived
+	/// [`LSPS5ServiceEvent::SendWebhookNotification`]: super::event::LSPS5ServiceEvent::SendWebhookNotification
+	/// [`WebhookNotification`]: super::msgs::WebhookNotification
 	pub fn parse_webhook_notification(
 		&self, counterparty_node_id: PublicKey, timestamp: &LSPSDateTime, signature: &str,
-		notification_json: &str,
-	) -> Result<WebhookNotification, LightningError> {
-		let event_queue_notifier = self.pending_events.notifier();
-		let notification: WebhookNotification =
-			serde_json::from_str(notification_json).map_err(|e| LightningError {
-				err: format!("Failed to parse notification: {}", e),
-				action: ErrorAction::IgnoreAndLog(Level::Error),
-			})?;
-
-		self.check_signature_exists(signature)?;
-
-		self.store_signature(signature.to_string())?;
-
+		notification: &WebhookNotification,
+	) -> Result<(), LSPS5ClientError> {
 		match self.verify_notification_signature(
 			counterparty_node_id,
 			timestamp,
@@ -588,13 +546,19 @@ where
 			&notification,
 		) {
 			Ok(signature_valid) => {
+				let event_queue_notifier = self.pending_events.notifier();
+
+				self.check_signature_exists(signature)?;
+
+				self.store_signature(signature.to_string());
+
 				event_queue_notifier.enqueue(LSPS5ClientEvent::WebhookNotificationReceived {
 					counterparty_node_id,
 					notification: notification.clone(),
 					timestamp: timestamp.clone(),
 					signature_valid,
 				});
-				Ok(notification)
+				Ok(())
 			},
 			Err(e) => Err(e),
 		}
@@ -622,7 +586,9 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		lsps0::ser::LSPSRequestId, lsps5::msgs::SetWebhookResponse, tests::utils::TestEntropy,
+		lsps0::ser::LSPSRequestId,
+		lsps5::{msgs::SetWebhookResponse, service::DefaultTimeProvider},
+		tests::utils::TestEntropy,
 	};
 	use bitcoin::{key::Secp256k1, secp256k1::SecretKey};
 
@@ -636,12 +602,13 @@ mod tests {
 		let test_entropy_source = Arc::new(TestEntropy {});
 		let message_queue = Arc::new(MessageQueue::new());
 		let event_queue = Arc::new(EventQueue::new());
-
+		let time_provider = Arc::new(DefaultTimeProvider);
 		let client = LSPS5ClientHandler::new(
 			test_entropy_source,
 			message_queue.clone(),
 			event_queue.clone(),
 			LSPS5ClientConfig::default(),
+			time_provider,
 		);
 
 		let secp = Secp256k1::new();
@@ -684,7 +651,7 @@ mod tests {
 		let lsps5_webhook_url = LSPS5WebhookUrl::from_string(WEBHOOK_URL.to_string()).unwrap();
 		let set_req_id =
 			client.set_webhook(peer, APP_NAME.to_string(), WEBHOOK_URL.to_string()).unwrap();
-		let list_req_id = client.list_webhooks(peer).unwrap();
+		let list_req_id = client.list_webhooks(peer);
 		let remove_req_id = client.remove_webhook(peer, "test-app".to_string()).unwrap();
 
 		{
