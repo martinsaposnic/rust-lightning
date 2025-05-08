@@ -16,7 +16,7 @@ categories = ["cryptography::cryptocurrencies"]
 [features]
 default = ["std", "time"]
 std = ["lightning/std"]
-time = []
+time = ["std"]
 backtrace = ["dep:backtrace"]
 
 [dependencies]
