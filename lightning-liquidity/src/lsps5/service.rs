@@ -9,6 +9,7 @@
 
 //! Service implementation for LSPS5 webhook registration.
 
+use crate::alloc::string::ToString;
 use crate::events::EventQueue;
 use crate::lsps0::ser::{LSPSDateTime, LSPSProtocolMessageHandler, LSPSRequestId};
 use crate::lsps5::msgs::{
@@ -17,23 +18,24 @@ use crate::lsps5::msgs::{
 };
 use crate::message_queue::MessageQueue;
 use crate::prelude::*;
-use core::ops::Deref;
-use core::time::Duration;
+use crate::sync::{Arc, Mutex};
 
 use bitcoin::secp256k1::{PublicKey, SecretKey};
+
 use lightning::ln::channelmanager::AChannelManager;
 use lightning::ln::msgs::{ErrorAction, LightningError};
 use lightning::util::logger::Level;
 use lightning::util::message_signing;
 
-use crate::alloc::string::ToString;
-use crate::sync::{Arc, Mutex};
+use core::ops::Deref;
+use core::time::Duration;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::event::LSPS5ServiceEvent;
 use super::msgs::{
-	LSPS5AppName, LSPS5Error, LSPS5Message, LSPS5Request, LSPS5Response, LSPS5WebhookUrl,
+	LSPS5AppName, LSPS5Message, LSPS5ProtocolError, LSPS5Request, LSPS5Response, LSPS5WebhookUrl,
 };
 
 /// Minimum number of days to retain webhooks after a client's last channel is closed.
@@ -44,15 +46,10 @@ pub const PRUNE_STALE_WEBHOOKS_INTERVAL_DAYS: Duration = Duration::from_secs(24 
 /// A stored webhook.
 #[derive(Debug, Clone)]
 struct StoredWebhook {
-	/// App name identifier for this webhook.
 	_app_name: LSPS5AppName,
-	/// The webhook URL.
 	url: LSPS5WebhookUrl,
-	/// Client node ID.
 	_counterparty_node_id: PublicKey,
-	/// Last time this webhook was used.
 	last_used: LSPSDateTime,
-	/// Map of notification methods to last time they were sent.
 	last_notification_sent: HashMap<WebhookNotificationMethod, LSPSDateTime>,
 }
 
@@ -78,8 +75,8 @@ impl TimeProvider for DefaultTimeProvider {
 	}
 }
 
-/// Configuration for LSPS5 service.
-#[derive(Clone)]
+/// Server-side configuration options for LSPS5 Webhook Registration.
+#[derive(Clone, Debug)]
 pub struct LSPS5ServiceConfig {
 	/// Maximum number of webhooks allowed per client.
 	pub max_webhooks_per_client: u32,
@@ -89,22 +86,48 @@ pub struct LSPS5ServiceConfig {
 	pub notification_cooldown_hours: Duration,
 }
 
-/// Default maximum number of webhooks allowed per client.
-pub const DEFAULT_MAX_WEBHOOKS_PER_CLIENT: u32 = 10;
-/// Default notification cooldown time in hours.
-pub const DEFAULT_NOTIFICATION_COOLDOWN_HOURS: Duration = Duration::from_secs(24 * 60 * 60);
-
-impl Default for LSPS5ServiceConfig {
-	fn default() -> Self {
-		Self {
-			max_webhooks_per_client: DEFAULT_MAX_WEBHOOKS_PER_CLIENT,
-			signing_key: SecretKey::from_slice(&[1; 32]).expect("Static key should be valid"),
-			notification_cooldown_hours: DEFAULT_NOTIFICATION_COOLDOWN_HOURS,
-		}
-	}
-}
-
-/// Service for handling LSPS5 webhook registration
+/// Service‐side handler for the LSPS5 (bLIP-55) webhook registration protocol.
+///
+/// Runs on the LSP (server) side. Stores and manages client-registered webhooks,
+/// enforces per-client limits and retention policies, and emits signed JSON-RPC
+/// notifications to each webhook endpoint when events occur.
+///
+/// # Core Responsibilities
+/// - Handle incoming JSON-RPC requests:
+///   - `lsps5.set_webhook` → insert or replace a webhook, enforce [`max_webhooks_per_client`],
+///     emit [`LSPS5ServiceEvent::WebhookRegistered`], and send an initial
+///     [`lsps5.webhook_registered`] notification if new or changed.
+///   - `lsps5.list_webhooks` → return all registered [`app_name`]s via response and
+///     [`LSPS5ServiceEvent::WebhooksListed`].
+///   - `lsps5.remove_webhook` → delete a named webhook or return [`app_name_not_found`]
+///     error, emitting [`LSPS5ServiceEvent::WebhookRemoved`].
+/// - Prune stale webhooks after a client has no open channels and no activity for at least
+/// [`MIN_WEBHOOK_RETENTION_DAYS`].
+/// - Rate-limit repeat notifications of the same method to a client by
+///   [`notification_cooldown_hours`].
+/// - Sign and enqueue outgoing webhook notifications:
+///   - Construct JSON-RPC 2.0 Notification objects [`WebhookNotification`],
+///   - Timestamp and LN-style zbase32-sign each payload,
+///   - Emit [`LSPS5ServiceEvent::SendWebhookNotification`] with HTTP headers.
+///
+/// # Security & Spec Compliance
+/// - All notifications are signed with the LSP’s node key according to bLIP-50/LSPS0.
+/// - Clients must validate signature, timestamp (±10 min), and replay protection via
+///   `LSPS5ClientHandler::parse_webhook_notification`.
+/// - Webhook endpoints use only HTTPS and must guard against unauthorized calls.
+///
+/// [`bLIP-55 / LSPS5 spec`]: https://github.com/lightning/blips/pull/55/files
+///
+/// [`max_webhooks_per_client`]: super::service::LSPS5ServiceConfig::max_webhooks_per_client
+/// [`LSPS5ServiceEvent::WebhookRegistered`]: super::event::LSPS5ServiceEvent::WebhookRegistered
+/// [`LSPS5ServiceEvent::WebhooksListed`]: super::event::LSPS5ServiceEvent::WebhooksListed
+/// [`LSPS5ServiceEvent::WebhookRemoved`]: super::event::LSPS5ServiceEvent::WebhookRemoved
+/// [`app_name_not_found`]: super::msgs::LSPS5ProtocolError::AppNameNotFound
+/// [`notification_cooldown_hours`]: super::service::LSPS5ServiceConfig::notification_cooldown_hours
+/// [`WebhookNotification`]: super::msgs::WebhookNotification
+/// [`LSPS5ServiceEvent::SendWebhookNotification`]: super::event::LSPS5ServiceEvent::SendWebhookNotification
+/// [`app_name`]: super::msgs::LSPS5AppName
+/// [`lsps5.webhook_registered`]: super::msgs::WebhookNotificationMethod::LSPS5WebhookRegistered
 pub struct LSPS5ServiceHandler<CM: Deref>
 where
 	CM::Target: AChannelManager,
@@ -122,37 +145,8 @@ impl<CM: Deref> LSPS5ServiceHandler<CM>
 where
 	CM::Target: AChannelManager,
 {
-	/// Create a new LSPS5 service handler.
-	///
-	/// # Arguments
-	/// * `event_queue` - Event queue for emitting events.
-	/// * `pending_messages` - Message queue for sending responses.
-	/// * `client_has_open_channel` - Function that checks if a client has an open channel.
-	/// * `config` - Configuration for the LSPS5 service.
-	#[cfg(feature = "time")]
+	/// Constructs a `LSPS5ServiceHandler`.
 	pub(crate) fn new(
-		event_queue: Arc<EventQueue>, pending_messages: Arc<MessageQueue>, channel_manager: CM,
-		config: LSPS5ServiceConfig,
-	) -> Self {
-		let time_provider = Arc::new(DefaultTimeProvider);
-		Self::new_with_custom_time_provider(
-			event_queue,
-			pending_messages,
-			channel_manager,
-			config,
-			time_provider,
-		)
-	}
-
-	/// Create a new LSPS5 service handler with a custom time provider.
-	///
-	/// # Arguments
-	/// * `event_queue` - Event queue for emitting events.
-	/// * `pending_messages` - Message queue for sending responses.
-	/// * `client_has_open_channel` - Function that checks if a client has an open channel.
-	/// * `config` - Configuration for the LSPS5 service.
-	/// * `time_provider` - Custom time provider.
-	pub(crate) fn new_with_custom_time_provider(
 		event_queue: Arc<EventQueue>, pending_messages: Arc<MessageQueue>, channel_manager: CM,
 		config: LSPS5ServiceConfig, time_provider: Arc<dyn TimeProvider>,
 	) -> Self {
@@ -167,7 +161,7 @@ where
 		}
 	}
 
-	fn check_prune_stale_webhooks(&self) -> Result<(), LightningError> {
+	fn check_prune_stale_webhooks(&self) {
 		let now =
 			LSPSDateTime::new_from_duration_since_epoch(self.time_provider.duration_since_epoch());
 		let should_prune = {
@@ -180,17 +174,14 @@ where
 		if should_prune {
 			self.prune_stale_webhooks();
 		}
-
-		Ok(())
 	}
 
-	/// Handle a set_webhook request.
-	pub fn handle_set_webhook(
+	fn handle_set_webhook(
 		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId,
 		params: SetWebhookRequest,
 	) -> Result<(), LightningError> {
 		let event_queue_notifier = self.event_queue.notifier();
-		self.check_prune_stale_webhooks()?;
+		self.check_prune_stale_webhooks();
 
 		let mut webhooks = self.webhooks.lock().unwrap();
 
@@ -205,21 +196,21 @@ where
 		if !client_webhooks.contains_key(&params.app_name)
 			&& client_webhooks.len() >= self.config.max_webhooks_per_client as usize
 		{
-			let message = format!(
-				"Maximum of {} webhooks allowed per client",
-				self.config.max_webhooks_per_client
+			let error = LSPS5ProtocolError::TooManyWebhooks(
+				self.config.max_webhooks_per_client.to_string(),
 			);
-			let error = LSPS5Error::TooManyWebhooks(message.clone());
-			let msg =
-				LSPS5Message::Response(request_id, LSPS5Response::SetWebhookError(error)).into();
+			let msg = LSPS5Message::Response(
+				request_id,
+				LSPS5Response::SetWebhookError(error.clone().into()),
+			)
+			.into();
 			self.pending_messages.enqueue(&counterparty_node_id, msg);
 			return Err(LightningError {
-				err: message,
+				err: error.message(),
 				action: ErrorAction::IgnoreAndLog(Level::Info),
 			});
 		}
 
-		// Add or replace the webhook
 		let stored_webhook = StoredWebhook {
 			_app_name: params.app_name.clone(),
 			url: params.webhook.clone(),
@@ -251,7 +242,7 @@ where
 				counterparty_node_id,
 				params.app_name.clone(),
 				params.webhook.clone(),
-			)?;
+			);
 		}
 
 		let msg = LSPS5Message::Response(request_id, LSPS5Response::SetWebhook(response)).into();
@@ -259,13 +250,12 @@ where
 		Ok(())
 	}
 
-	/// Handle a list_webhooks request.
-	pub fn handle_list_webhooks(
+	fn handle_list_webhooks(
 		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId,
 		_params: ListWebhooksRequest,
 	) -> Result<(), LightningError> {
 		let event_queue_notifier = self.event_queue.notifier();
-		self.check_prune_stale_webhooks()?;
+		self.check_prune_stale_webhooks();
 
 		let webhooks = self.webhooks.lock().unwrap();
 
@@ -290,14 +280,12 @@ where
 		Ok(())
 	}
 
-	/// Handle a remove_webhook request.
-	pub fn handle_remove_webhook(
+	fn handle_remove_webhook(
 		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId,
 		params: RemoveWebhookRequest,
 	) -> Result<(), LightningError> {
 		let event_queue_notifier = self.event_queue.notifier();
-		// Check if we need to prune stale webhooks
-		self.check_prune_stale_webhooks()?;
+		self.check_prune_stale_webhooks();
 
 		let mut webhooks = self.webhooks.lock().unwrap();
 
@@ -320,75 +308,97 @@ where
 			}
 		}
 
-		let error_message = format!("App name not found: {}", params.app_name);
-		let error = LSPS5Error::AppNameNotFound(error_message.clone());
-		let msg =
-			LSPS5Message::Response(request_id, LSPS5Response::RemoveWebhookError(error)).into();
+		let error = LSPS5ProtocolError::AppNameNotFound;
+		let msg = LSPS5Message::Response(
+			request_id,
+			LSPS5Response::RemoveWebhookError(error.clone().into()),
+		)
+		.into();
 
 		self.pending_messages.enqueue(&counterparty_node_id, msg);
 		return Err(LightningError {
-			err: error_message,
+			err: error.message(),
 			action: ErrorAction::IgnoreAndLog(Level::Info),
 		});
 	}
 
-	/// Send a webhook_registered notification to a newly registered webhook.
-	///
-	/// According to spec:
-	/// "Only the newly-registered webhook is notified.
-	/// Only the newly-registered webhook is contacted for this notification".
 	fn send_webhook_registered_notification(
 		&self, client_node_id: PublicKey, app_name: LSPS5AppName, url: LSPS5WebhookUrl,
-	) -> Result<(), LightningError> {
+	) {
 		let notification = WebhookNotification::webhook_registered();
 		self.send_notification(client_node_id, app_name.clone(), url.clone(), notification)
 	}
 
-	/// Send an incoming_payment notification to all of a client's webhooks.
-	pub fn notify_payment_incoming(&self, client_id: PublicKey) -> Result<(), LightningError> {
+	/// Notify the LSP service that the client has one or more incoming payments pending.
+	///
+	/// SHOULD be called by your LSP application logic as soon as you detect an incoming
+	/// payment (HTLC or future mechanism) for `client_id`.
+	/// This builds a [`WebhookNotificationMethod::LSPS5PaymentIncoming`] webhook notification, signs it with your
+	/// node key, and enqueues HTTP POSTs to all registered webhook URLs for that client.
+	///
+	/// # Parameters
+	/// - `client_id`: the client’s node‐ID whose webhooks should be invoked.
+	///
+	/// [`WebhookNotificationMethod::LSPS5PaymentIncoming`]: super::msgs::WebhookNotificationMethod::LSPS5PaymentIncoming
+	pub fn notify_payment_incoming(&self, client_id: PublicKey) {
 		let notification = WebhookNotification::payment_incoming();
 		self.broadcast_notification(client_id, notification)
 	}
 
-	/// Send an expiry_soon notification to all of a client's webhooks.
-	pub fn notify_expiry_soon(
-		&self, client_id: PublicKey, timeout: u32,
-	) -> Result<(), LightningError> {
+	/// Notify that an HTLC or other time‐bound contract is expiring soon.
+	///
+	/// SHOULD be called by your LSP application logic when a channel contract for `client_id`
+	/// is within 24 blocks of timeout, and the timeout would cause a channel closure.
+	/// Builds a [`WebhookNotificationMethod::LSPS5ExpirySoon`] notification including
+	/// the `timeout` block height, signs it, and enqueues HTTP POSTs to the client’s
+	/// registered webhooks.
+	///
+	/// # Parameters
+	/// - `client_id`: the client’s node‐ID whose webhooks should be invoked.
+	/// - `timeout`: the block height at which the channel contract will expire.
+	///
+	/// [`WebhookNotificationMethod::LSPS5ExpirySoon`]: super::msgs::WebhookNotificationMethod::LSPS5ExpirySoon
+	pub fn notify_expiry_soon(&self, client_id: PublicKey, timeout: u32) {
 		let notification = WebhookNotification::expiry_soon(timeout);
 		self.broadcast_notification(client_id, notification)
 	}
 
-	/// Send a liquidity_management_request notification to all of a client's webhooks.
-	pub fn notify_liquidity_management_request(
-		&self, client_id: PublicKey,
-	) -> Result<(), LightningError> {
+	/// Notify that the LSP intends to manage liquidity (e.g. close or splice) on client channels.
+	///
+	/// SHOULD be called by your LSP application logic when you decide to reclaim or adjust
+	/// liquidity for `client_id`. Builds a [`WebhookNotificationMethod::LSPS5LiquidityManagementRequest`] notification,
+	/// signs it, and sends it to all of the client’s registered webhook URLs.
+	///
+	/// # Parameters
+	/// - `client_id`: the client’s node‐ID whose webhooks should be invoked.
+	///
+	/// [`WebhookNotificationMethod::LSPS5LiquidityManagementRequest`]: super::msgs::WebhookNotificationMethod::LSPS5LiquidityManagementRequest
+	pub fn notify_liquidity_management_request(&self, client_id: PublicKey) {
 		let notification = WebhookNotification::liquidity_management_request();
 		self.broadcast_notification(client_id, notification)
 	}
 
-	/// Send an onion_message_incoming notification to all of a client's webhooks.
-	pub fn notify_onion_message_incoming(
-		&self, client_id: PublicKey,
-	) -> Result<(), LightningError> {
+	/// Notify that the client has one or more pending BOLT Onion Messages.
+	///
+	/// SHOULD be called by your LSP application logic when you receive Onion Messages
+	/// for `client_id` while the client is offline. Builds a [`WebhookNotificationMethod::LSPS5LiquidityManagementRequest`]
+	/// notification, signs it, and enqueues HTTP POSTs to each registered webhook.
+	///
+	/// # Parameters
+	/// - `client_id`: the client’s node‐ID whose webhooks should be invoked.
+	///
+	/// [`WebhookNotificationMethod::LSPS5OnionMessageIncoming`]: super::msgs::WebhookNotificationMethod::LSPS5OnionMessageIncoming
+	pub fn notify_onion_message_incoming(&self, client_id: PublicKey) {
 		let notification = WebhookNotification::onion_message_incoming();
 		self.broadcast_notification(client_id, notification)
 	}
 
-	/// Broadcast a notification to all registered webhooks for a client.
-	///
-	/// According to spec:
-	/// "The LSP SHOULD contact all registered webhook URIs, if:
-	/// * The client has registered at least one via `lsps5.set_webhook`.
-	/// * *and* the client currently does not have a BOLT8 tunnel with the LSP.
-	/// * *and* one of the specified events has occurred."
-	fn broadcast_notification(
-		&self, client_id: PublicKey, notification: WebhookNotification,
-	) -> Result<(), LightningError> {
+	fn broadcast_notification(&self, client_id: PublicKey, notification: WebhookNotification) {
 		let mut webhooks = self.webhooks.lock().unwrap();
 
 		let client_webhooks = match webhooks.get_mut(&client_id) {
 			Some(webhooks) if !webhooks.is_empty() => webhooks,
-			_ => return Ok(()),
+			_ => return,
 		};
 
 		let now =
@@ -409,29 +419,20 @@ where
 					app_name.clone(),
 					webhook.url.clone(),
 					notification.clone(),
-				)?;
+				);
 			}
 		}
-
-		Ok(())
 	}
 
-	/// Send a notification to a webhook URL.
 	fn send_notification(
 		&self, counterparty_node_id: PublicKey, app_name: LSPS5AppName, url: LSPS5WebhookUrl,
 		notification: WebhookNotification,
-	) -> Result<(), LightningError> {
+	) {
 		let event_queue_notifier = self.event_queue.notifier();
 		let timestamp =
 			LSPSDateTime::new_from_duration_since_epoch(self.time_provider.duration_since_epoch());
 
-		let notification_json =
-			serde_json::to_string(&notification).map_err(|e| LightningError {
-				err: format!("Failed to serialize notification: {}", e),
-				action: ErrorAction::IgnoreAndLog(Level::Error),
-			})?;
-
-		let signature_hex = self.sign_notification(&notification_json, &timestamp)?;
+		let signature_hex = self.sign_notification(&notification, &timestamp);
 
 		let headers = vec![
 			("Content-Type".to_string(), "application/json".to_string()),
@@ -439,7 +440,7 @@ where
 			("x-lsps5-signature".to_string(), signature_hex.clone()),
 		];
 
-		event_queue_notifier.enqueue(LSPS5ServiceEvent::SendWebhookNotifications {
+		event_queue_notifier.enqueue(LSPS5ServiceEvent::SendWebhookNotification {
 			counterparty_node_id,
 			app_name,
 			url,
@@ -448,41 +449,18 @@ where
 			signature: signature_hex,
 			headers,
 		});
-
-		Ok(())
 	}
 
-	/// Sign a webhook notification with an LSP's signing key.
-	///
-	/// This function takes a notification body and timestamp and returns a signature
-	/// in the format required by the LSPS5 specification.
-	///
-	/// # Arguments
-	///
-	/// * `body` - The serialized notification JSON
-	/// * `timestamp` - The ISO8601 timestamp string
-	/// * `signing_key` - The LSP private key used for signing
-	///
-	/// # Returns
-	///
-	/// * The zbase32 encoded signature as specified in LSPS0, or an error if signing fails
-	pub fn sign_notification(
-		&self, body: &str, timestamp: &LSPSDateTime,
-	) -> Result<String, LightningError> {
-		// Create the message to sign
-		// According to spec:
-		// The message to be signed is: "LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {}",
+	fn sign_notification(&self, body: &WebhookNotification, timestamp: &LSPSDateTime) -> String {
 		let message = format!(
-			"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {}",
+			"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {:?}",
 			timestamp.to_rfc3339(),
 			body
 		);
 
-		Ok(message_signing::sign(message.as_bytes(), &self.config.signing_key))
+		message_signing::sign(message.as_bytes(), &self.config.signing_key)
 	}
 
-	/// Clean up webhooks for clients with no channels that haven't been used in a while.
-	/// According to spec: "MUST remember all webhooks for at least 7 days after the last channel is closed".
 	fn prune_stale_webhooks(&self) {
 		let now =
 			LSPSDateTime::new_from_duration_since_epoch(self.time_provider.duration_since_epoch());
@@ -544,10 +522,12 @@ where
 					false,
 					"Service handler received LSPS5 response message. This should never happen."
 				);
-				Err(LightningError {
-                    err: format!("Service handler received LSPS5 response message from node {:?}. This should never happen.", counterparty_node_id),
-                    action: ErrorAction::IgnoreAndLog(Level::Info)
-                })
+				let err = format!(
+					"Service handler received LSPS5 response message from node {:?}. 
+				This should never happen.",
+					counterparty_node_id
+				);
+				Err(LightningError { err, action: ErrorAction::IgnoreAndLog(Level::Info) })
 			},
 		}
 	}
