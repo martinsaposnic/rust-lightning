@@ -2495,7 +2495,7 @@ where
 	#[cfg(test)]
 	pub(super) forward_htlcs: Mutex<HashMap<u64, Vec<HTLCForwardInfo>>>,
 	#[cfg(not(test))]
-	forward_htlcs: Mutex<HashMap<u64, Vec<HTLCForwardInfo>>>,
+	pub forward_htlcs: Mutex<HashMap<u64, Vec<HTLCForwardInfo>>>,
 	/// Storage for HTLCs that have been intercepted and bubbled up to the user. We hold them here
 	/// until the user tells us what we should do with them.
 	///
