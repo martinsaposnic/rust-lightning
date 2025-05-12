@@ -86,7 +86,7 @@ pub struct LSPS5ServiceConfig {
 	pub notification_cooldown_hours: Duration,
 }
 
-/// Service‐side handler for the LSPS5 (bLIP-55) webhook registration protocol.
+/// Service‐side handler for the [`bLIP-55 / LSPS5`] webhook registration protocol.
 ///
 /// Runs on the LSP (server) side. Stores and manages client-registered webhooks,
 /// enforces per-client limits and retention policies, and emits signed JSON-RPC
@@ -116,8 +116,7 @@ pub struct LSPS5ServiceConfig {
 ///   `LSPS5ClientHandler::parse_webhook_notification`.
 /// - Webhook endpoints use only HTTPS and must guard against unauthorized calls.
 ///
-/// [`bLIP-55 / LSPS5 spec`]: https://github.com/lightning/blips/pull/55/files
-///
+/// [`bLIP-55 / LSPS5`]: https://github.com/lightning/blips/pull/55/files
 /// [`max_webhooks_per_client`]: super::service::LSPS5ServiceConfig::max_webhooks_per_client
 /// [`LSPS5ServiceEvent::WebhookRegistered`]: super::event::LSPS5ServiceEvent::WebhookRegistered
 /// [`LSPS5ServiceEvent::WebhooksListed`]: super::event::LSPS5ServiceEvent::WebhooksListed
