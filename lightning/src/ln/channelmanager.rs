@@ -352,21 +352,21 @@ pub struct PendingHTLCInfo {
 }
 
 #[derive(Clone)] // See FundedChannel::revoke_and_ack for why, tl;dr: Rust bug
-pub(super) enum HTLCFailureMsg {
+pub enum HTLCFailureMsg {
 	Relay(msgs::UpdateFailHTLC),
 	Malformed(msgs::UpdateFailMalformedHTLC),
 }
 
 /// Stores whether we can't forward an HTLC or relevant forwarding info
 #[derive(Clone)] // See FundedChannel::revoke_and_ack for why, tl;dr: Rust bug
-pub(super) enum PendingHTLCStatus {
+pub enum PendingHTLCStatus {
 	Forward(PendingHTLCInfo),
 	Fail(HTLCFailureMsg),
 }
 
 #[cfg_attr(test, derive(Clone, Debug, PartialEq))]
-pub(super) struct PendingAddHTLCInfo {
-	pub(super) forward_info: PendingHTLCInfo,
+pub struct PendingAddHTLCInfo {
+	pub forward_info: PendingHTLCInfo,
 
 	// These fields are produced in `forward_htlcs()` and consumed in
 	// `process_pending_htlc_forwards()` for constructing the
@@ -383,7 +383,7 @@ pub(super) struct PendingAddHTLCInfo {
 }
 
 #[cfg_attr(test, derive(Clone, Debug, PartialEq))]
-pub(super) enum HTLCForwardInfo {
+pub enum HTLCForwardInfo {
 	AddHTLC(PendingAddHTLCInfo),
 	FailHTLC {
 		htlc_id: u64,
