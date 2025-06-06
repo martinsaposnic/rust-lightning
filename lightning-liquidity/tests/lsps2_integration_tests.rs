@@ -7,15 +7,21 @@ use common::{get_lsps_message, Node};
 
 use lightning_liquidity::events::LiquidityEvent;
 use lightning_liquidity::lsps0::ser::LSPSDateTime;
+use lightning_liquidity::lsps0::ser::LSPSMessage;
+use lightning_liquidity::lsps0::ser::LSPSRequestId;
+use lightning_liquidity::lsps0::ser::LSPSResponseError;
 use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
 use lightning_liquidity::lsps2::event::LSPS2ClientEvent;
 use lightning_liquidity::lsps2::event::LSPS2ServiceEvent;
 use lightning_liquidity::lsps2::msgs::LSPS2RawOpeningFeeParams;
+use lightning_liquidity::lsps2::msgs::{LSPS2Message, LSPS2Response};
 use lightning_liquidity::lsps2::service::LSPS2ServiceConfig;
 use lightning_liquidity::lsps2::utils::is_valid_opening_fee_params;
+use serde_json;
 
 use lightning::ln::channelmanager::{InterceptId, MIN_FINAL_CLTV_EXPIRY_DELTA};
 use lightning::ln::peer_handler::CustomMessageHandler;
+use lightning::ln::types::ChannelId;
 use lightning::log_error;
 use lightning::routing::router::{RouteHint, RouteHintHop};
 use lightning::util::errors::APIError;
@@ -745,4 +751,331 @@ fn invalid_token_flow() {
 	} else {
 		panic!("Expected LSPS2ClientEvent::GetInfoFailed event");
 	}
+}
+
+#[test]
+fn buy_request_payment_size_below_min() {
+	let (service_node_id, client_node_id, service_node, client_node, _) =
+		setup_test_lsps2("buy_request_payment_size_below_min");
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+	let client_handler = client_node.liquidity_manager.lsps2_client_handler().unwrap();
+
+	let get_info_request_id = client_handler.request_opening_params(service_node_id, None);
+	let get_info_request = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(get_info_request, client_node_id).unwrap();
+	let _get_info_event = service_node.liquidity_manager.next_event().unwrap();
+
+	let raw_opening_params = LSPS2RawOpeningFeeParams {
+		min_fee_msat: 100,
+		proportional: 0,
+		valid_until: LSPSDateTime::from_str("2035-05-20T08:30:45Z").unwrap(),
+		min_lifetime: 144,
+		max_client_to_self_delay: 128,
+		min_payment_size_msat: 1000,
+		max_payment_size_msat: 1_000_000,
+	};
+	service_handler
+		.opening_fee_params_generated(
+			&client_node_id,
+			get_info_request_id.clone(),
+			vec![raw_opening_params],
+		)
+		.unwrap();
+	let get_info_response = get_lsps_message!(service_node, client_node_id);
+	client_node
+		.liquidity_manager
+		.handle_custom_message(get_info_response, service_node_id)
+		.unwrap();
+
+	let opening_fee_params = match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
+			opening_fee_params_menu,
+			..
+		}) => opening_fee_params_menu.first().unwrap().clone(),
+		_ => panic!("Unexpected event"),
+	};
+
+	let payment_size_msat = Some(500);
+	let buy_request_id = client_handler
+		.select_opening_params(service_node_id, payment_size_msat, opening_fee_params)
+		.unwrap();
+	let buy_request = get_lsps_message!(client_node, service_node_id);
+
+	let result = service_node.liquidity_manager.handle_custom_message(buy_request, client_node_id);
+	assert!(result.is_err());
+	let buy_error_response = get_lsps_message!(service_node, client_node_id);
+	let result =
+		client_node.liquidity_manager.handle_custom_message(buy_error_response, service_node_id);
+	assert!(result.is_err());
+	let event = client_node.liquidity_manager.next_event().unwrap();
+	if let LiquidityEvent::LSPS2Client(LSPS2ClientEvent::BuyRequestFailed {
+		request_id,
+		counterparty_node_id,
+		error,
+	}) = event
+	{
+		assert_eq!(request_id, buy_request_id);
+		assert_eq!(counterparty_node_id, service_node_id);
+		assert_eq!(error.code, 202);
+	} else {
+		panic!("Expected BuyRequestFailed event");
+	}
+}
+
+#[test]
+fn buy_request_payment_size_above_max() {
+	let (service_node_id, client_node_id, service_node, client_node, _) =
+		setup_test_lsps2("buy_request_payment_size_above_max");
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+	let client_handler = client_node.liquidity_manager.lsps2_client_handler().unwrap();
+
+	let get_info_request_id = client_handler.request_opening_params(service_node_id, None);
+	let get_info_request = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(get_info_request, client_node_id).unwrap();
+	let _get_info_event = service_node.liquidity_manager.next_event().unwrap();
+
+	let raw_opening_params = LSPS2RawOpeningFeeParams {
+		min_fee_msat: 100,
+		proportional: 0,
+		valid_until: LSPSDateTime::from_str("2035-05-20T08:30:45Z").unwrap(),
+		min_lifetime: 144,
+		max_client_to_self_delay: 128,
+		min_payment_size_msat: 1000,
+		max_payment_size_msat: 2_000,
+	};
+	service_handler
+		.opening_fee_params_generated(
+			&client_node_id,
+			get_info_request_id.clone(),
+			vec![raw_opening_params],
+		)
+		.unwrap();
+	let get_info_response = get_lsps_message!(service_node, client_node_id);
+	client_node
+		.liquidity_manager
+		.handle_custom_message(get_info_response, service_node_id)
+		.unwrap();
+	let opening_fee_params = match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
+			opening_fee_params_menu,
+			..
+		}) => opening_fee_params_menu.first().unwrap().clone(),
+		_ => panic!("Unexpected event"),
+	};
+
+	let payment_size_msat = Some(5_000);
+	let buy_request_id = client_handler
+		.select_opening_params(service_node_id, payment_size_msat, opening_fee_params)
+		.unwrap();
+	let buy_request = get_lsps_message!(client_node, service_node_id);
+
+	let result = service_node.liquidity_manager.handle_custom_message(buy_request, client_node_id);
+	assert!(result.is_err());
+	let buy_error_response = get_lsps_message!(service_node, client_node_id);
+	let result =
+		client_node.liquidity_manager.handle_custom_message(buy_error_response, service_node_id);
+	assert!(result.is_err());
+	let event = client_node.liquidity_manager.next_event().unwrap();
+	if let LiquidityEvent::LSPS2Client(LSPS2ClientEvent::BuyRequestFailed {
+		request_id,
+		counterparty_node_id,
+		error,
+	}) = event
+	{
+		assert_eq!(request_id, buy_request_id);
+		assert_eq!(counterparty_node_id, service_node_id);
+		assert_eq!(error.code, 203);
+	} else {
+		panic!("Expected BuyRequestFailed event");
+	}
+}
+
+#[test]
+fn buy_request_insufficient_for_fee() {
+	let (service_node_id, client_node_id, service_node, client_node, _) =
+		setup_test_lsps2("buy_request_insufficient_for_fee");
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+	let client_handler = client_node.liquidity_manager.lsps2_client_handler().unwrap();
+
+	let get_info_request_id = client_handler.request_opening_params(service_node_id, None);
+	let get_info_request = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(get_info_request, client_node_id).unwrap();
+	let _get_info_event = service_node.liquidity_manager.next_event().unwrap();
+
+	let raw_opening_params = LSPS2RawOpeningFeeParams {
+		min_fee_msat: 10_000,
+		proportional: 0,
+		valid_until: LSPSDateTime::from_str("2035-05-20T08:30:45Z").unwrap(),
+		min_lifetime: 144,
+		max_client_to_self_delay: 128,
+		min_payment_size_msat: 1,
+		max_payment_size_msat: 20_000,
+	};
+	service_handler
+		.opening_fee_params_generated(
+			&client_node_id,
+			get_info_request_id.clone(),
+			vec![raw_opening_params],
+		)
+		.unwrap();
+	let get_info_response = get_lsps_message!(service_node, client_node_id);
+	client_node
+		.liquidity_manager
+		.handle_custom_message(get_info_response, service_node_id)
+		.unwrap();
+	let opening_fee_params = match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
+			opening_fee_params_menu,
+			..
+		}) => opening_fee_params_menu.first().unwrap().clone(),
+		_ => panic!("Unexpected event"),
+	};
+
+	let payment_size_msat = Some(5_000);
+	let buy_request_id = client_handler
+		.select_opening_params(service_node_id, payment_size_msat, opening_fee_params)
+		.unwrap();
+	let buy_request = get_lsps_message!(client_node, service_node_id);
+
+	let result = service_node.liquidity_manager.handle_custom_message(buy_request, client_node_id);
+	assert!(result.is_err());
+	let buy_error_response = get_lsps_message!(service_node, client_node_id);
+	let result =
+		client_node.liquidity_manager.handle_custom_message(buy_error_response, service_node_id);
+	assert!(result.is_err());
+	let event = client_node.liquidity_manager.next_event().unwrap();
+	if let LiquidityEvent::LSPS2Client(LSPS2ClientEvent::BuyRequestFailed {
+		request_id,
+		counterparty_node_id,
+		error,
+	}) = event
+	{
+		assert_eq!(request_id, buy_request_id);
+		assert_eq!(counterparty_node_id, service_node_id);
+		assert_eq!(error.code, 202);
+	} else {
+		panic!("Expected BuyRequestFailed event");
+	}
+}
+
+#[test]
+fn buy_request_invalid_opening_fee_params() {
+	let (service_node_id, client_node_id, service_node, client_node, _) =
+		setup_test_lsps2("buy_request_invalid_opening_fee_params");
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+	let client_handler = client_node.liquidity_manager.lsps2_client_handler().unwrap();
+
+	let get_info_request_id = client_handler.request_opening_params(service_node_id, None);
+	let get_info_request = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(get_info_request, client_node_id).unwrap();
+	let _get_info_event = service_node.liquidity_manager.next_event().unwrap();
+
+	let raw_opening_params = LSPS2RawOpeningFeeParams {
+		min_fee_msat: 100,
+		proportional: 0,
+		valid_until: LSPSDateTime::from_str("2035-05-20T08:30:45Z").unwrap(),
+		min_lifetime: 144,
+		max_client_to_self_delay: 128,
+		min_payment_size_msat: 1,
+		max_payment_size_msat: 10_000,
+	};
+	service_handler
+		.opening_fee_params_generated(
+			&client_node_id,
+			get_info_request_id.clone(),
+			vec![raw_opening_params],
+		)
+		.unwrap();
+	let get_info_response = get_lsps_message!(service_node, client_node_id);
+	client_node
+		.liquidity_manager
+		.handle_custom_message(get_info_response, service_node_id)
+		.unwrap();
+	let mut opening_fee_params = match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
+			opening_fee_params_menu,
+			..
+		}) => opening_fee_params_menu.first().unwrap().clone(),
+		_ => panic!("Unexpected event"),
+	};
+
+	opening_fee_params.promise = "deadbeef".to_string();
+	let payment_size_msat = Some(5_000);
+	let buy_request_id = client_handler
+		.select_opening_params(service_node_id, payment_size_msat, opening_fee_params)
+		.unwrap();
+	let buy_request = get_lsps_message!(client_node, service_node_id);
+
+	let result = service_node.liquidity_manager.handle_custom_message(buy_request, client_node_id);
+	assert!(result.is_err());
+	let buy_error_response = get_lsps_message!(service_node, client_node_id);
+	let result =
+		client_node.liquidity_manager.handle_custom_message(buy_error_response, service_node_id);
+	assert!(result.is_err());
+	let event = client_node.liquidity_manager.next_event().unwrap();
+	if let LiquidityEvent::LSPS2Client(LSPS2ClientEvent::BuyRequestFailed {
+		request_id,
+		counterparty_node_id,
+		error,
+	}) = event
+	{
+		assert_eq!(request_id, buy_request_id);
+		assert_eq!(counterparty_node_id, service_node_id);
+		assert_eq!(error.code, 201);
+	} else {
+		panic!("Expected BuyRequestFailed event");
+	}
+}
+#[test]
+fn channel_ready_unknown_counterparty() {
+	let (_service_node_id, client_node_id, service_node, _client_node, _) =
+		setup_test_lsps2("channel_ready_unknown_counterparty");
+
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	let channel_id = ChannelId([1; 32]);
+	let result = service_handler.channel_ready(0, &channel_id, &client_node_id);
+	assert!(result.is_err());
+	match result.unwrap_err() {
+		APIError::APIMisuseError { err } => {
+			assert!(err.contains("No counterparty state for"));
+		},
+		other => panic!("Unexpected error type: {:?}", other),
+	}
+}
+
+#[test]
+fn client_get_info_error_unknown_request() {
+	let (service_node_id, _client_node_id, _service_node, client_node, _) =
+		setup_test_lsps2("client_get_info_error_unknown_request");
+
+	let error = LSPSResponseError { code: 1, message: "oops".to_string(), data: None };
+	let request_id = LSPSRequestId("deadbeef".to_string());
+	let msg = lightning_liquidity::lsps0::ser::RawLSPSMessage {
+		payload: serde_json::to_string(&LSPSMessage::from(LSPS2Message::Response(
+			request_id,
+			LSPS2Response::GetInfoError(error),
+		)))
+		.unwrap(),
+	};
+	let result = client_node.liquidity_manager.handle_custom_message(msg, service_node_id);
+	assert!(result.is_err());
+}
+
+#[test]
+fn client_buy_error_unknown_request() {
+	let (service_node_id, _client_node_id, _service_node, client_node, _) =
+		setup_test_lsps2("client_buy_error_unknown_request");
+
+	let error = LSPSResponseError { code: 1, message: "oops".to_string(), data: None };
+	let request_id = LSPSRequestId("deadbeef".to_string());
+	let msg = lightning_liquidity::lsps0::ser::RawLSPSMessage {
+		payload: serde_json::to_string(&LSPSMessage::from(LSPS2Message::Response(
+			request_id,
+			LSPS2Response::BuyError(error),
+		)))
+		.unwrap(),
+	};
+	let result = client_node.liquidity_manager.handle_custom_message(msg, service_node_id);
+	assert!(result.is_err());
 }

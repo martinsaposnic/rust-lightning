@@ -126,7 +126,7 @@ where
 /// [`Event::ChannelReady`]: lightning::events::Event::ChannelReady
 /// [`Event::HTLCHandlingFailed`]: lightning::events::Event::HTLCHandlingFailed
 /// [`Event::PaymentForwarded`]: lightning::events::Event::PaymentForwarded
-pub struct LiquidityManager<ES: Deref + Clone, CM: Deref + Clone, C: Deref + Clone>
+pub struct LiquidityManager<ES: Deref + Clone, CM: Deref + Clone + 'static, C: Deref + Clone>
 where
 	ES::Target: EntropySource,
 	CM::Target: AChannelManager,

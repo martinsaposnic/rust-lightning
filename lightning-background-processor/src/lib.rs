@@ -238,7 +238,8 @@ impl<
 		G,
 		&'a (dyn UtxoLookup + Send + Sync),
 		L,
-	> where
+	>
+where
 	L::Target: Logger,
 {
 	/// Initializes a new [`GossipSync::Rapid`] variant.
@@ -255,7 +256,8 @@ impl<'a, L: Deref>
 		&'a NetworkGraph<L>,
 		&'a (dyn UtxoLookup + Send + Sync),
 		L,
-	> where
+	>
+where
 	L::Target: Logger,
 {
 	/// Initializes a new [`GossipSync::None`] variant.
@@ -789,7 +791,7 @@ pub async fn process_events_async<
 	PGS: 'static + Deref<Target = P2PGossipSync<G, UL, L>>,
 	RGS: 'static + Deref<Target = RapidGossipSync<G, L>>,
 	PM: 'static + Deref,
-	LM: 'static + Deref,
+	LM: 'static + Deref + Send,
 	D: 'static + Deref,
 	O: 'static + Deref,
 	K: 'static + Deref,

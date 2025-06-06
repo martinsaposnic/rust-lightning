@@ -11,6 +11,7 @@
 
 pub mod client;
 pub mod event;
+pub mod jit_state;
 pub mod msgs;
 pub(crate) mod payment_queue;
 pub mod service;

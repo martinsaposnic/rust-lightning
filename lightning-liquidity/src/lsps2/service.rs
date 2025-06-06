@@ -22,6 +22,7 @@ use crate::lsps0::ser::{
 	LSPS0_CLIENT_REJECTED_ERROR_CODE,
 };
 use crate::lsps2::event::LSPS2ServiceEvent;
+use crate::lsps2::jit_state::{JITChannelState, PendingInitialPaymentState};
 use crate::lsps2::payment_queue::{InterceptedHTLC, PaymentQueue};
 use crate::lsps2::utils::{
 	compute_opening_fee, is_expired_opening_fee_params, is_valid_opening_fee_params,
@@ -32,7 +33,7 @@ use crate::prelude::{new_hash_map, HashMap};
 use crate::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use lightning::events::HTLCHandlingFailureType;
-use lightning::ln::channelmanager::{AChannelManager, FailureCode, InterceptId};
+use lightning::ln::channelmanager::{AChannelManager, InterceptId};
 use lightning::ln::msgs::{ErrorAction, LightningError};
 use lightning::ln::types::ChannelId;
 use lightning::util::errors::APIError;
@@ -64,23 +65,8 @@ pub struct LSPS2ServiceConfig {
 	pub promise_secret: [u8; 32],
 }
 
-/// Information about the initial payment size and JIT channel opening fee.
-/// This will be provided in the `OpenChannel` event.
-#[derive(Clone, Debug, PartialEq)]
-struct OpenChannelParams {
-	opening_fee_msat: u64,
-	amt_to_forward_msat: u64,
-}
-
-/// A payment that will be forwarded while skimming the given JIT channel opening fee.
-#[derive(Clone, Debug, PartialEq)]
-struct FeePayment {
-	htlcs: Vec<InterceptedHTLC>,
-	opening_fee_msat: u64,
-}
-
 #[derive(Debug)]
-struct ChannelStateError(String);
+pub(crate) struct ChannelStateError(pub String);
 
 impl From<ChannelStateError> for LightningError {
 	fn from(value: ChannelStateError) -> Self {
@@ -88,367 +74,12 @@ impl From<ChannelStateError> for LightningError {
 	}
 }
 
-/// Possible actions that need to be taken when an HTLC is intercepted.
-#[derive(Debug, PartialEq)]
-enum HTLCInterceptedAction {
-	/// The opening of the JIT channel.
-	OpenChannel(OpenChannelParams),
-	/// The forwarding of the intercepted HTLC.
-	ForwardHTLC(ChannelId),
-	ForwardPayment(ChannelId, FeePayment),
-}
-
-/// The forwarding of a payment while skimming the JIT channel opening fee.
-#[derive(Debug, PartialEq)]
-struct ForwardPaymentAction(ChannelId, FeePayment);
-
-/// The forwarding of previously intercepted HTLCs without skimming any further fees.
-#[derive(Debug, PartialEq)]
-struct ForwardHTLCsAction(ChannelId, Vec<InterceptedHTLC>);
-
-/// The different states a requested JIT channel can be in.
-trait JITChannelState: 'static {
-	/// Handle an intercepted HTLC and return the new state and any action to take
-	fn htlc_intercepted(
-		self: Box<Self>, opening_fee_params: &LSPS2OpeningFeeParams,
-		payment_size_msat: &Option<u64>, htlc: InterceptedHTLC, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<HTLCInterceptedAction>), ChannelStateError>;
-
-	/// Handle channel becoming ready and return the new state and any action to take
-	fn channel_ready(
-		self: Box<Self>, channel_id: ChannelId, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError>;
-
-	/// Handle HTLC handling failure and return the new state and any action to take
-	fn htlc_handling_failed(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError>;
-
-	/// Handle payment forwarded and return the new state and any action to take
-	fn payment_forwarded(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardHTLCsAction>), ChannelStateError>;
-
-	/// Check if this state is pending initial payment
-	fn is_pending_initial_payment(&self) -> bool {
-		false
-	}
-
-	/// Check if this state is prunable (expired and no HTLCs intercepted)
-	fn is_prunable(&self, _opening_fee_params: &LSPS2OpeningFeeParams) -> bool {
-		false
-	}
-
-	/// Get the current channel ID if available
-	fn get_channel_id(&self) -> Option<ChannelId> {
-		None
-	}
-}
-
-/// State 1: Waiting for the first payment to arrive
-/// Transitions to: PendingChannelOpen (when sufficient payment received)
-struct PendingInitialPaymentState;
-
-impl JITChannelState for PendingInitialPaymentState {
-	fn htlc_intercepted(
-		self: Box<Self>, opening_fee_params: &LSPS2OpeningFeeParams,
-		payment_size_msat: &Option<u64>, htlc: InterceptedHTLC, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<HTLCInterceptedAction>), ChannelStateError> {
-		let (total_expected_outbound_amount_msat, num_htlcs) = payment_queue.add_htlc(htlc);
-
-		let (expected_payment_size_msat, mpp_mode) =
-			if let Some(payment_size_msat) = payment_size_msat {
-				(*payment_size_msat, true)
-			} else {
-				debug_assert_eq!(num_htlcs, 1);
-				if num_htlcs != 1 {
-					return Err(ChannelStateError(
-						"Paying via multiple HTLCs is disallowed in \"no-MPP+var-invoice\" mode."
-							.to_string(),
-					));
-				}
-				(total_expected_outbound_amount_msat, false)
-			};
-
-		if expected_payment_size_msat < opening_fee_params.min_payment_size_msat
-			|| expected_payment_size_msat > opening_fee_params.max_payment_size_msat
-		{
-			return Err(ChannelStateError(
-					format!("Payment size violates our limits: expected_payment_size_msat = {}, min_payment_size_msat = {}, max_payment_size_msat = {}",
-							expected_payment_size_msat,
-							opening_fee_params.min_payment_size_msat,
-							opening_fee_params.max_payment_size_msat
-					)));
-		}
-
-		let opening_fee_msat = compute_opening_fee(
-			expected_payment_size_msat,
-			opening_fee_params.min_fee_msat,
-			opening_fee_params.proportional.into(),
-		).ok_or(ChannelStateError(
-			format!("Could not compute valid opening fee with min_fee_msat = {}, proportional = {}, and expected_payment_size_msat = {}",
-				opening_fee_params.min_fee_msat,
-				opening_fee_params.proportional,
-				expected_payment_size_msat
-			))
-		)?;
-
-		let amt_to_forward_msat = expected_payment_size_msat.saturating_sub(opening_fee_msat);
-
-		// Transition to PendingChannelOpen if we have sufficient HTLCs
-		if total_expected_outbound_amount_msat >= expected_payment_size_msat
-			&& amt_to_forward_msat > 0
-		{
-			let new_state = Box::new(PendingChannelOpenState { opening_fee_msat });
-			let action = HTLCInterceptedAction::OpenChannel(OpenChannelParams {
-				opening_fee_msat,
-				amt_to_forward_msat,
-			});
-			Ok((new_state, Some(action)))
-		} else if mpp_mode {
-			// Stay in same state, waiting for more HTLCs
-			Ok((self, None))
-		} else {
-			Err(ChannelStateError("Intercepted HTLC is too small to pay opening fee".to_string()))
-		}
-	}
-
-	fn is_pending_initial_payment(&self) -> bool {
-		true
-	}
-
-	fn is_prunable(&self, opening_fee_params: &LSPS2OpeningFeeParams) -> bool {
-		is_expired_opening_fee_params(opening_fee_params)
-	}
-
-	fn channel_ready(
-		self: Box<Self>, channel_id: ChannelId, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError> {
-		todo!()
-	}
-
-	fn htlc_handling_failed(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError> {
-		todo!()
-	}
-
-	fn payment_forwarded(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardHTLCsAction>), ChannelStateError> {
-		todo!()
-	}
-}
-
-/// State 2: Channel is being opened, waiting for it to become ready
-/// Transitions to: PendingPaymentForward (when channel ready)
-struct PendingChannelOpenState {
-	opening_fee_msat: u64,
-}
-
-impl JITChannelState for PendingChannelOpenState {
-	fn htlc_intercepted(
-		self: Box<Self>, _opening_fee_params: &LSPS2OpeningFeeParams,
-		_payment_size_msat: &Option<u64>, htlc: InterceptedHTLC, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<HTLCInterceptedAction>), ChannelStateError> {
-		payment_queue.add_htlc(htlc);
-		// Stay in same state
-		Ok((self, None))
-	}
-
-	fn channel_ready(
-		self: Box<Self>, channel_id: ChannelId, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError> {
-		if let Some((_payment_hash, htlcs)) =
-			payment_queue.pop_greater_than_msat(self.opening_fee_msat)
-		{
-			let new_state = Box::new(PendingPaymentForwardState {
-				opening_fee_msat: self.opening_fee_msat,
-				channel_id,
-			});
-			let action = ForwardPaymentAction(
-				channel_id,
-				FeePayment { opening_fee_msat: self.opening_fee_msat, htlcs },
-			);
-			Ok((new_state, Some(action)))
-		} else {
-			Err(ChannelStateError(
-				"No forwardable payment available when moving to channel ready.".to_string(),
-			))
-		}
-	}
-
-	fn htlc_handling_failed(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError> {
-		todo!()
-	}
-
-	fn payment_forwarded(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardHTLCsAction>), ChannelStateError> {
-		todo!()
-	}
-}
-
-/// State 3: Channel is ready, payment is being forwarded with fee deduction
-/// Transitions to: PaymentForwarded (when payment succeeds) or PendingPayment (when payment fails)
-struct PendingPaymentForwardState {
-	opening_fee_msat: u64,
-	channel_id: ChannelId,
-}
-
-impl JITChannelState for PendingPaymentForwardState {
-	fn htlc_intercepted(
-		self: Box<Self>, _opening_fee_params: &LSPS2OpeningFeeParams,
-		_payment_size_msat: &Option<u64>, htlc: InterceptedHTLC, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<HTLCInterceptedAction>), ChannelStateError> {
-		payment_queue.add_htlc(htlc);
-		// Stay in same state
-		Ok((self, None))
-	}
-
-	fn htlc_handling_failed(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError> {
-		if let Some((_payment_hash, htlcs)) =
-			payment_queue.pop_greater_than_msat(self.opening_fee_msat)
-		{
-			// Try to forward next payment, stay in same state
-			let action = ForwardPaymentAction(
-				self.channel_id,
-				FeePayment { htlcs, opening_fee_msat: self.opening_fee_msat },
-			);
-			Ok((self, Some(action)))
-		} else {
-			// No more payments to forward, transition to PendingPayment
-			let new_state = Box::new(PendingPaymentState {
-				opening_fee_msat: self.opening_fee_msat,
-				channel_id: self.channel_id,
-			});
-			Ok((new_state, None))
-		}
-	}
-
-	fn payment_forwarded(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardHTLCsAction>), ChannelStateError> {
-		// Payment succeeded! Transition to PaymentForwarded and forward any queued HTLCs
-		let htlcs = payment_queue.clear();
-		let new_state = Box::new(PaymentForwardedState { channel_id: self.channel_id });
-		let action =
-			if !htlcs.is_empty() { Some(ForwardHTLCsAction(self.channel_id, htlcs)) } else { None };
-		Ok((new_state, action))
-	}
-
-	fn get_channel_id(&self) -> Option<ChannelId> {
-		Some(self.channel_id)
-	}
-
-	fn channel_ready(
-		self: Box<Self>, channel_id: ChannelId, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError> {
-		todo!()
-	}
-}
-
-/// State 4: Channel is ready but fee hasn't been paid yet, waiting for sufficient payment
-/// Transitions to: PendingPaymentForward (when sufficient payment arrives)
-struct PendingPaymentState {
-	opening_fee_msat: u64,
-	channel_id: ChannelId,
-}
-
-impl JITChannelState for PendingPaymentState {
-	fn htlc_intercepted(
-		self: Box<Self>, _opening_fee_params: &LSPS2OpeningFeeParams,
-		_payment_size_msat: &Option<u64>, htlc: InterceptedHTLC, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<HTLCInterceptedAction>), ChannelStateError> {
-		payment_queue.add_htlc(htlc);
-		if let Some((_payment_hash, htlcs)) =
-			payment_queue.pop_greater_than_msat(self.opening_fee_msat)
-		{
-			// Sufficient payment arrived, transition to PendingPaymentForward
-			let new_state = Box::new(PendingPaymentForwardState {
-				opening_fee_msat: self.opening_fee_msat,
-				channel_id: self.channel_id,
-			});
-			let action = HTLCInterceptedAction::ForwardPayment(
-				self.channel_id,
-				FeePayment { htlcs, opening_fee_msat: self.opening_fee_msat },
-			);
-			Ok((new_state, Some(action)))
-		} else {
-			// Not enough payment yet, stay in same state
-			Ok((self, None))
-		}
-	}
-
-	fn get_channel_id(&self) -> Option<ChannelId> {
-		Some(self.channel_id)
-	}
-
-	fn channel_ready(
-		self: Box<Self>, channel_id: ChannelId, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError> {
-		todo!()
-	}
-
-	fn htlc_handling_failed(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError> {
-		todo!()
-	}
-
-	fn payment_forwarded(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardHTLCsAction>), ChannelStateError> {
-		todo!()
-	}
-}
-
-/// State 5: Fee has been paid, all future payments forward normally
-/// This is the terminal state - no transitions out
-struct PaymentForwardedState {
-	channel_id: ChannelId,
-}
-
-impl JITChannelState for PaymentForwardedState {
-	fn htlc_intercepted(
-		self: Box<Self>, _opening_fee_params: &LSPS2OpeningFeeParams,
-		_payment_size_msat: &Option<u64>, _htlc: InterceptedHTLC,
-		_payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<HTLCInterceptedAction>), ChannelStateError> {
-		// All payments forward normally now
-		let action = HTLCInterceptedAction::ForwardHTLC(self.channel_id);
-		Ok((self, Some(action)))
-	}
-
-	fn get_channel_id(&self) -> Option<ChannelId> {
-		Some(self.channel_id)
-	}
-
-	fn channel_ready(
-		self: Box<Self>, channel_id: ChannelId, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError> {
-		todo!()
-	}
-
-	fn htlc_handling_failed(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardPaymentAction>), ChannelStateError> {
-		todo!()
-	}
-
-	fn payment_forwarded(
-		self: Box<Self>, payment_queue: &mut PaymentQueue,
-	) -> Result<(Box<dyn JITChannelState>, Option<ForwardHTLCsAction>), ChannelStateError> {
-		todo!()
-	}
-}
-
 /// Container for the JIT channel state machine
-struct OutboundJITChannelStateMachine {
+struct OutboundJITChannelStateMachine<CM: Deref + Clone>
+where
+	CM::Target: AChannelManager,
+{
+	channel_manager: CM,
 	state: Option<Box<dyn JITChannelState>>,
 	payment_queue: PaymentQueue,
 	user_channel_id: u128,
@@ -456,68 +87,88 @@ struct OutboundJITChannelStateMachine {
 	payment_size_msat: Option<u64>,
 }
 
-impl OutboundJITChannelStateMachine {
+impl<CM: Deref + Clone + 'static> OutboundJITChannelStateMachine<CM>
+where
+	CM::Target: AChannelManager,
+{
 	fn new(
 		payment_size_msat: Option<u64>, opening_fee_params: LSPS2OpeningFeeParams,
-		user_channel_id: u128,
+		user_channel_id: u128, channel_manager: CM, counterparty_node_id: PublicKey,
+		pending_events: Arc<EventQueue>,
 	) -> Self {
 		Self {
-			state: Some(Box::new(PendingInitialPaymentState)),
 			payment_queue: PaymentQueue::new(),
 			user_channel_id,
 			opening_fee_params,
 			payment_size_msat,
+			channel_manager: channel_manager.clone(),
+			state: Some(Box::new(PendingInitialPaymentState {
+				channel_manager,
+				counterparty_node_id,
+				pending_events,
+			})),
 		}
 	}
 
 	fn htlc_intercepted(
-		&mut self, htlc: InterceptedHTLC,
-	) -> Result<Option<HTLCInterceptedAction>, ChannelStateError> {
+		&mut self, htlc: InterceptedHTLC, intercept_scid: u64,
+	) -> Result<(), APIError> {
 		if let Some(s) = self.state.take() {
-			let (new_state, action) = s.htlc_intercepted(
-				&self.opening_fee_params,
-				&self.payment_size_msat,
-				htlc,
-				&mut self.payment_queue,
-			)?;
-			self.state = Some(new_state);
-			Ok(action)
-		} else {
-			Err(ChannelStateError("State machine in invalid state".to_string()))
-		}
-	}
+			let new_state = s
+				.htlc_intercepted(
+					&self.opening_fee_params,
+					&self.payment_size_msat,
+					htlc,
+					&mut self.payment_queue,
+					intercept_scid,
+					self.user_channel_id,
+				)
+				.or_else(|e| {
+					self.channel_manager.get_cm().fail_intercepted_htlc(htlc.intercept_id)?;
 
-	fn channel_ready(
-		&mut self, channel_id: ChannelId,
-	) -> Result<ForwardPaymentAction, ChannelStateError> {
-		if let Some(s) = self.state.take() {
-			let (new_state, action) = s.channel_ready(channel_id, &mut self.payment_queue)?;
+					// TODO: cleanup peer_by_intercept_scid
+					return Err(e);
+				})?;
 			self.state = Some(new_state);
-			action.ok_or_else(|| {
-				ChannelStateError("Expected ForwardPaymentAction from channel_ready".to_string())
+			Ok(())
+		} else {
+			Err(APIError::APIMisuseError {
+				err: "Failed to transition to channel ready state".to_string(),
 			})
-		} else {
-			Err(ChannelStateError("State machine in invalid state".to_string()))
 		}
 	}
 
-	fn htlc_handling_failed(&mut self) -> Result<Option<ForwardPaymentAction>, ChannelStateError> {
+	fn channel_ready(&mut self, channel_id: ChannelId) -> Result<(), APIError> {
 		if let Some(s) = self.state.take() {
-			let (new_state, action) = s.htlc_handling_failed(&mut self.payment_queue)?;
+			let new_state = s.channel_ready(channel_id, &mut self.payment_queue)?;
 			self.state = Some(new_state);
-			Ok(action)
+			Ok(())
 		} else {
-			Err(ChannelStateError("State machine in invalid state".to_string()))
+			return Err(APIError::APIMisuseError {
+				err: format!("Failed to transition to channel ready"),
+			});
 		}
 	}
 
-	fn payment_forwarded(&mut self) -> Result<Option<ForwardHTLCsAction>, ChannelStateError> {
+	fn htlc_handling_failed(&mut self) -> Result<(), APIError> {
 		if let Some(s) = self.state.take() {
-			let (new_state, action) = s.payment_forwarded(&mut self.payment_queue)?;
+			let new_state = s.htlc_handling_failed(&mut self.payment_queue)?;
 			self.state = Some(new_state);
-			Ok(action)
+			Ok(())
 		} else {
-			Err(ChannelStateError("State machine in invalid state".to_string()))
+			return Err(APIError::APIMisuseError { err: "Unable to fail HTLC".to_string() });
+		}
+	}
+
+	fn payment_forwarded(&mut self) -> Result<(), APIError> {
+		if let Some(s) = self.state.take() {
+			let new_state = s.payment_forwarded(&mut self.payment_queue)?;
+			self.state = Some(new_state);
+			Ok(())
+		} else {
+			return Err(APIError::APIMisuseError {
+				err: "Forwarded payment was not applicable for JIT channel".to_string(),
+			});
 		}
 	}
 
@@ -535,14 +186,20 @@ impl OutboundJITChannelStateMachine {
 	}
 }
 
-struct PeerState {
-	outbound_channels_by_intercept_scid: HashMap<u64, OutboundJITChannelStateMachine>,
+struct PeerState<CM: Deref + Clone + 'static>
+where
+	CM::Target: AChannelManager,
+{
+	outbound_channels_by_intercept_scid: HashMap<u64, OutboundJITChannelStateMachine<CM>>,
 	intercept_scid_by_user_channel_id: HashMap<u128, u64>,
 	intercept_scid_by_channel_id: HashMap<ChannelId, u64>,
 	pending_requests: HashMap<LSPSRequestId, LSPS2Request>,
 }
 
-impl PeerState {
+impl<CM: Deref + Clone + 'static> PeerState<CM>
+where
+	CM::Target: AChannelManager,
+{
 	fn new() -> Self {
 		let outbound_channels_by_intercept_scid = new_hash_map();
 		let pending_requests = new_hash_map();
@@ -557,7 +214,7 @@ impl PeerState {
 	}
 
 	fn insert_outbound_channel(
-		&mut self, intercept_scid: u64, channel: OutboundJITChannelStateMachine,
+		&mut self, intercept_scid: u64, channel: OutboundJITChannelStateMachine<CM>,
 	) {
 		self.outbound_channels_by_intercept_scid.insert(intercept_scid, channel);
 	}
@@ -635,21 +292,21 @@ macro_rules! get_or_insert_peer_state_entry {
 }
 
 /// The main object allowing to send and receive bLIP-52 / LSPS2 messages.
-pub struct LSPS2ServiceHandler<CM: Deref>
+pub struct LSPS2ServiceHandler<CM: Deref + Clone + 'static>
 where
 	CM::Target: AChannelManager,
 {
 	channel_manager: CM,
 	pending_messages: Arc<MessageQueue>,
 	pending_events: Arc<EventQueue>,
-	per_peer_state: RwLock<HashMap<PublicKey, Mutex<PeerState>>>,
+	per_peer_state: RwLock<HashMap<PublicKey, Mutex<PeerState<CM>>>>,
 	peer_by_intercept_scid: RwLock<HashMap<u64, PublicKey>>,
 	peer_by_channel_id: RwLock<HashMap<ChannelId, PublicKey>>,
 	total_pending_requests: AtomicUsize,
 	config: LSPS2ServiceConfig,
 }
 
-impl<CM: Deref> LSPS2ServiceHandler<CM>
+impl<CM: Deref + Clone> LSPS2ServiceHandler<CM>
 where
 	CM::Target: AChannelManager,
 {
@@ -818,6 +475,9 @@ where
 								buy_request.payment_size_msat,
 								buy_request.opening_fee_params,
 								user_channel_id,
+								self.channel_manager.clone(),
+								*counterparty_node_id,
+								self.pending_events.clone(),
 							);
 
 							peer_state_lock
@@ -880,8 +540,6 @@ where
 		&self, intercept_scid: u64, intercept_id: InterceptId, expected_outbound_amount_msat: u64,
 		payment_hash: PaymentHash,
 	) -> Result<(), APIError> {
-		let event_queue_notifier = self.pending_events.notifier();
-
 		let peer_by_intercept_scid = self.peer_by_intercept_scid.read().unwrap();
 		if let Some(counterparty_node_id) = peer_by_intercept_scid.get(&intercept_scid) {
 			let outer_state_lock = self.per_peer_state.read().unwrap();
@@ -896,55 +554,10 @@ where
 							expected_outbound_amount_msat,
 							payment_hash,
 						};
-						match jit_channel.htlc_intercepted(htlc) {
-							Ok(Some(HTLCInterceptedAction::OpenChannel(open_channel_params))) => {
-								let event = LSPS2ServiceEvent::OpenChannel {
-									their_network_key: counterparty_node_id.clone(),
-									amt_to_forward_msat: open_channel_params.amt_to_forward_msat,
-									opening_fee_msat: open_channel_params.opening_fee_msat,
-									user_channel_id: jit_channel.user_channel_id,
-									intercept_scid,
-								};
-								event_queue_notifier.enqueue(event);
-							},
-							Ok(Some(HTLCInterceptedAction::ForwardHTLC(channel_id))) => {
-								self.channel_manager.get_cm().forward_intercepted_htlc(
-									intercept_id,
-									&channel_id,
-									*counterparty_node_id,
-									expected_outbound_amount_msat,
-								)?;
-							},
-							Ok(Some(HTLCInterceptedAction::ForwardPayment(
-								channel_id,
-								FeePayment { opening_fee_msat, htlcs },
-							))) => {
-								let amounts_to_forward_msat =
-									calculate_amount_to_forward_per_htlc(&htlcs, opening_fee_msat);
-
-								for (intercept_id, amount_to_forward_msat) in
-									amounts_to_forward_msat
-								{
-									self.channel_manager.get_cm().forward_intercepted_htlc(
-										intercept_id,
-										&channel_id,
-										*counterparty_node_id,
-										amount_to_forward_msat,
-									)?;
-								}
-							},
-							Ok(None) => {},
-							Err(e) => {
-								self.channel_manager
-									.get_cm()
-									.fail_intercepted_htlc(intercept_id)?;
-								peer_state
-									.outbound_channels_by_intercept_scid
-									.remove(&intercept_scid);
-								// TODO: cleanup peer_by_intercept_scid
-								return Err(APIError::APIMisuseError { err: e.0 });
-							},
-						}
+						jit_channel.htlc_intercepted(htlc, intercept_scid).or_else(|e| {
+							peer_state.outbound_channels_by_intercept_scid.remove(&intercept_scid);
+							Err(e)
+						})?
 					}
 				},
 				None => {
@@ -982,37 +595,7 @@ where
 								.outbound_channels_by_intercept_scid
 								.get_mut(&intercept_scid)
 							{
-								match jit_channel.htlc_handling_failed() {
-									Ok(Some(ForwardPaymentAction(
-										channel_id,
-										FeePayment { opening_fee_msat, htlcs },
-									))) => {
-										let amounts_to_forward_msat =
-											calculate_amount_to_forward_per_htlc(
-												&htlcs,
-												opening_fee_msat,
-											);
-
-										for (intercept_id, amount_to_forward_msat) in
-											amounts_to_forward_msat
-										{
-											self.channel_manager
-												.get_cm()
-												.forward_intercepted_htlc(
-													intercept_id,
-													&channel_id,
-													*counterparty_node_id,
-													amount_to_forward_msat,
-												)?;
-										}
-									},
-									Ok(None) => {},
-									Err(e) => {
-										return Err(APIError::APIMisuseError {
-											err: format!("Unable to fail HTLC: {}.", e.err),
-										});
-									},
-								}
+								jit_channel.htlc_handling_failed()?
 							}
 						}
 					},
@@ -1049,27 +632,7 @@ where
 						if let Some(jit_channel) =
 							peer_state.outbound_channels_by_intercept_scid.get_mut(&intercept_scid)
 						{
-							match jit_channel.payment_forwarded() {
-								Ok(Some(ForwardHTLCsAction(channel_id, htlcs))) => {
-									for htlc in htlcs {
-										self.channel_manager.get_cm().forward_intercepted_htlc(
-											htlc.intercept_id,
-											&channel_id,
-											*counterparty_node_id,
-											htlc.expected_outbound_amount_msat,
-										)?;
-									}
-								},
-								Ok(None) => {},
-								Err(e) => {
-									return Err(APIError::APIMisuseError {
-										err: format!(
-											"Forwarded payment was not applicable for JIT channel: {}",
-											e.err
-										),
-									})
-								},
-							}
+							jit_channel.payment_forwarded()?
 						}
 					} else {
 						return Err(APIError::APIMisuseError {
@@ -1193,6 +756,9 @@ where
 				jit_channel.payment_size_msat,
 				jit_channel.opening_fee_params.clone(),
 				jit_channel.user_channel_id,
+				self.channel_manager.clone(),
+				*counterparty_node_id,
+				self.pending_events.clone(),
 			);
 			Ok(())
 		} else {
@@ -1226,34 +792,7 @@ where
 					if let Some(jit_channel) =
 						peer_state.outbound_channels_by_intercept_scid.get_mut(&intercept_scid)
 					{
-						match jit_channel.channel_ready(*channel_id) {
-							Ok(ForwardPaymentAction(
-								channel_id,
-								FeePayment { opening_fee_msat, htlcs },
-							)) => {
-								let amounts_to_forward_msat =
-									calculate_amount_to_forward_per_htlc(&htlcs, opening_fee_msat);
-
-								for (intercept_id, amount_to_forward_msat) in
-									amounts_to_forward_msat
-								{
-									self.channel_manager.get_cm().forward_intercepted_htlc(
-										intercept_id,
-										&channel_id,
-										*counterparty_node_id,
-										amount_to_forward_msat,
-									)?;
-								}
-							},
-							Err(e) => {
-								return Err(APIError::APIMisuseError {
-									err: format!(
-										"Failed to transition to channel ready: {}",
-										e.err
-									),
-								})
-							},
-						}
+						jit_channel.channel_ready(*channel_id)?
 					} else {
 						return Err(APIError::APIMisuseError {
 							err: format!(
@@ -1440,7 +979,7 @@ where
 	}
 
 	fn insert_pending_request<'a>(
-		&self, peer_state_lock: &mut MutexGuard<'a, PeerState>, request_id: LSPSRequestId,
+		&self, peer_state_lock: &mut MutexGuard<'a, PeerState<CM>>, request_id: LSPSRequestId,
 		counterparty_node_id: PublicKey, request: LSPS2Request,
 	) -> (Result<(), LightningError>, Option<LSPSMessage>) {
 		let create_pending_request_limit_exceeded_response = |error_message: String| {
@@ -1485,7 +1024,7 @@ where
 	}
 
 	fn remove_pending_request<'a>(
-		&self, peer_state_lock: &mut MutexGuard<'a, PeerState>, request_id: &LSPSRequestId,
+		&self, peer_state_lock: &mut MutexGuard<'a, PeerState<CM>>, request_id: &LSPSRequestId,
 	) -> Option<LSPS2Request> {
 		match peer_state_lock.pending_requests.remove(request_id) {
 			Some(req) => {
@@ -1552,7 +1091,7 @@ where
 	}
 }
 
-impl<CM: Deref> LSPSProtocolMessageHandler for LSPS2ServiceHandler<CM>
+impl<CM: Deref + Clone + 'static> LSPSProtocolMessageHandler for LSPS2ServiceHandler<CM>
 where
 	CM::Target: AChannelManager,
 {
@@ -1585,41 +1124,6 @@ where
 			},
 		}
 	}
-}
-
-fn calculate_amount_to_forward_per_htlc(
-	htlcs: &[InterceptedHTLC], total_fee_msat: u64,
-) -> Vec<(InterceptId, u64)> {
-	// TODO: we should eventually make sure the HTLCs are all above ChannelDetails::next_outbound_minimum_msat
-	let total_expected_outbound_msat: u64 =
-		htlcs.iter().map(|htlc| htlc.expected_outbound_amount_msat).sum();
-	if total_fee_msat > total_expected_outbound_msat {
-		debug_assert!(false, "Fee is larger than the total expected outbound amount.");
-		return Vec::new();
-	}
-
-	let mut fee_remaining_msat = total_fee_msat;
-	let mut per_htlc_forwards = vec![];
-	for (index, htlc) in htlcs.iter().enumerate() {
-		let proportional_fee_amt_msat = (total_fee_msat as u128
-			* htlc.expected_outbound_amount_msat as u128
-			/ total_expected_outbound_amount_msat as u128) as u64;
-
-		let mut actual_fee_amt_msat = core::cmp::min(fee_remaining_msat, proportional_fee_amt_msat);
-		actual_fee_amt_msat =
-			core::cmp::min(actual_fee_amt_msat, htlc.expected_outbound_amount_msat);
-		fee_remaining_msat -= actual_fee_amt_msat;
-
-		if index == htlcs.len() - 1 {
-			actual_fee_amt_msat += fee_remaining_msat;
-		}
-
-		let amount_to_forward_msat =
-			htlc.expected_outbound_amount_msat.saturating_sub(actual_fee_amt_msat);
-
-		per_htlc_forwards.push((htlc.intercept_id, amount_to_forward_msat))
-	}
-	per_htlc_forwards
 }
 
 #[cfg(test)]
