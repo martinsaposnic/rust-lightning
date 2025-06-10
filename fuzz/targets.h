@@ -62,3 +62,6 @@ void msg_stfu_run(const unsigned char* data, size_t data_len);
 void msg_splice_init_run(const unsigned char* data, size_t data_len);
 void msg_splice_ack_run(const unsigned char* data, size_t data_len);
 void msg_splice_locked_run(const unsigned char* data, size_t data_len);
+void lsps_message_run(const unsigned char* data, size_t data_len);
+void raw_lsps_message_run(const unsigned char* data, size_t data_len);
+void scid_parse_run(const unsigned char* data, size_t data_len);

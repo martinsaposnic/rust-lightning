@@ -23,13 +23,16 @@ pub mod full_stack;
 pub mod indexedmap;
 pub mod invoice_deser;
 pub mod invoice_request_deser;
+pub mod lsps_message;
 pub mod offer_deser;
 pub mod onion_hop_data;
 pub mod onion_message;
 pub mod peer_crypt;
 pub mod process_network_graph;
+pub mod raw_lsps_message;
 pub mod refund_deser;
 pub mod router;
+pub mod scid_parse;
 pub mod zbase32;
 
 pub mod msg_targets;

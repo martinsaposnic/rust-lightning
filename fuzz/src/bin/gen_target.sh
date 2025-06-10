@@ -77,3 +77,6 @@ GEN_TEST msg_stfu msg_targets::
 GEN_TEST msg_splice_init msg_targets::
 GEN_TEST msg_splice_ack msg_targets::
 GEN_TEST msg_splice_locked msg_targets::
+GEN_TEST lsps_message
+GEN_TEST raw_lsps_message
+GEN_TEST scid_parse
