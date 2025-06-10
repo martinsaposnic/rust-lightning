@@ -9,7 +9,7 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 
 use crate::utils::test_logger;
-use lightning::util::ser::{Readable, Writeable, Writer};
+use lightning::util::ser::{LengthReadable, Writeable, Writer};
 use lightning_liquidity::lsps0::ser::RawLSPSMessage;
 
 pub struct VecWriter(pub Vec<u8>);
@@ -22,11 +22,11 @@ impl Writer for VecWriter {
 
 #[inline]
 pub fn do_test(data: &[u8]) {
-	let mut cursor = lightning::io::Cursor::new(data);
-	if let Ok(msg) = RawLSPSMessage::read_from_fixed_length_buffer(&mut cursor) {
+    let mut reader = &data[..];
+    if let Ok(msg) = RawLSPSMessage::read_from_fixed_length_buffer(&mut reader) {
 		let mut w = VecWriter(Vec::new());
 		msg.write(&mut w).unwrap();
-		let _ = RawLSPSMessage::read_from_fixed_length_buffer(&mut lightning::io::Cursor::new(&w.0));
+        let _ = RawLSPSMessage::read_from_fixed_length_buffer(&mut &w.0[..]);
 	}
 }
 

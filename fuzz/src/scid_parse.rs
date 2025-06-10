@@ -7,7 +7,17 @@
 // licenses.
 
 use crate::utils::test_logger;
-use lightning_liquidity::utils::scid_from_human_readable_string;
+
+#[inline]
+fn scid_from_human_readable_string(human_readable_scid: &str) -> Result<u64, ()> {
+    let mut parts = human_readable_scid.split('x');
+
+    let block: u64 = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+    let tx_index: u64 = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+    let vout_index: u64 = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+
+    Ok((block << 40) | (tx_index << 16) | vout_index)
+}
 
 #[inline]
 pub fn do_test(data: &[u8]) {
