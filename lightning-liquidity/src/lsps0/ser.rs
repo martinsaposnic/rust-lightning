@@ -52,13 +52,20 @@ pub(crate) const JSONRPC_INTERNAL_ERROR_ERROR_MESSAGE: &str = "Internal error";
 
 pub(crate) const LSPS0_CLIENT_REJECTED_ERROR_CODE: i32 = 1;
 
+/// Possible methods used by LSPS protocols.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum LSPSMethod {
+pub enum LSPSMethod {
+	/// LSPS0 method to list protocols.
 	LSPS0ListProtocols,
+	/// LSPS1 method to get information about the LSP.
 	LSPS1GetInfo,
+	/// LSPS1 method to create an order for a channel.
 	LSPS1GetOrder,
+	/// LSPS1 method to create an order for a channel.
 	LSPS1CreateOrder,
+	/// LSPS2 method to get information about the LSP.
 	LSPS2GetInfo,
+	/// LSPS2 method to buy a channel.
 	LSPS2Buy,
 }
 
@@ -262,7 +269,7 @@ impl LSPSMessage {
 	///
 	/// The given `request_id_to_method` associates request ids with method names, as response objects
 	/// don't carry the latter.
-	pub(crate) fn from_str_with_id_map(
+	pub fn from_str_with_id_map(
 		json_str: &str, request_id_to_method_map: &mut HashMap<LSPSRequestId, LSPSMethod>,
 	) -> Result<Self, serde_json::Error> {
 		let deserializer = &mut serde_json::Deserializer::from_str(json_str);
