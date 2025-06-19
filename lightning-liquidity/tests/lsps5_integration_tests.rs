@@ -132,25 +132,6 @@ fn webhook_registration_flow() {
 		.handle_custom_message(set_webhook_request, client_node_id)
 		.unwrap();
 
-	let set_webhook_event = service_node.liquidity_manager.next_event().unwrap();
-
-	match set_webhook_event {
-		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::WebhookRegistered {
-			counterparty_node_id,
-			app_name: an,
-			url: wu,
-			no_change,
-			request_id: req_id,
-		}) => {
-			assert_eq!(counterparty_node_id, client_node_id);
-			assert_eq!(an, app_name.clone());
-			assert_eq!(wu, webhook_url);
-			assert_eq!(no_change, false);
-			assert_eq!(req_id, request_id);
-		},
-		_ => panic!("Unexpected event"),
-	}
-
 	let webhook_notification_event = service_node.liquidity_manager.next_event().unwrap();
 	match webhook_notification_event {
 		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::SendWebhookNotification {
@@ -213,23 +194,6 @@ fn webhook_registration_flow() {
 		.handle_custom_message(list_webhooks_request, client_node_id)
 		.unwrap();
 
-	let list_webhooks_event = service_node.liquidity_manager.next_event().unwrap();
-
-	match list_webhooks_event {
-		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::WebhooksListed {
-			app_names,
-			counterparty_node_id,
-			max_webhooks,
-			request_id: req_id,
-		}) => {
-			assert_eq!(app_names, vec![app_name.clone()]);
-			assert_eq!(counterparty_node_id, client_node_id);
-			assert_eq!(max_webhooks, DEFAULT_MAX_WEBHOOKS_PER_CLIENT);
-			assert_eq!(req_id, list_request_id);
-		},
-		_ => panic!("Unexpected event"),
-	}
-
 	let list_webhooks_response = get_lsps_message!(service_node, client_node_id);
 
 	client_node
@@ -256,7 +220,7 @@ fn webhook_registration_flow() {
 	let raw_updated_webhook_url = "https://www.example.org/push?l=updatedtoken&c=best";
 	let updated_webhook_url =
 		LSPS5WebhookUrl::from_string(raw_updated_webhook_url.to_string()).unwrap();
-	let update_request_id = client_handler
+	let _ = client_handler
 		.set_webhook(service_node_id, raw_app_name.to_string(), raw_updated_webhook_url.to_string())
 		.expect("Failed to send update webhook request");
 
@@ -266,24 +230,6 @@ fn webhook_registration_flow() {
 		.liquidity_manager
 		.handle_custom_message(set_webhook_update_request, client_node_id)
 		.unwrap();
-
-	let set_webhook_update_event = service_node.liquidity_manager.next_event().unwrap();
-	match set_webhook_update_event {
-		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::WebhookRegistered {
-			counterparty_node_id,
-			app_name: an,
-			url: wu,
-			no_change,
-			request_id: req_id,
-		}) => {
-			assert_eq!(counterparty_node_id, client_node_id);
-			assert_eq!(an, app_name);
-			assert_eq!(wu, updated_webhook_url);
-			assert_eq!(no_change, false);
-			assert_eq!(req_id, update_request_id);
-		},
-		_ => panic!("Unexpected event"),
-	}
 
 	let webhook_notification_event = service_node.liquidity_manager.next_event().unwrap();
 	match webhook_notification_event {
@@ -326,20 +272,6 @@ fn webhook_registration_flow() {
 		.liquidity_manager
 		.handle_custom_message(remove_webhook_request, client_node_id)
 		.unwrap();
-
-	let remove_webhook_event = service_node.liquidity_manager.next_event().unwrap();
-	match remove_webhook_event {
-		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::WebhookRemoved {
-			counterparty_node_id,
-			app_name: an,
-			request_id: req_id,
-		}) => {
-			assert_eq!(counterparty_node_id, client_node_id);
-			assert_eq!(an, app_name);
-			assert_eq!(req_id, remove_request_id);
-		},
-		_ => panic!("Unexpected event"),
-	}
 
 	let remove_webhook_response = get_lsps_message!(service_node, client_node_id);
 
@@ -502,8 +434,6 @@ fn webhook_notification_delivery_test() {
 		.handle_custom_message(set_webhook_request, client_node_id)
 		.unwrap();
 
-	let _ = service_node.liquidity_manager.next_event().unwrap();
-
 	let notification_event = service_node.liquidity_manager.next_event().unwrap();
 	let (timestamp_value, signature_value, notification) = match notification_event {
 		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::SendWebhookNotification {
@@ -618,8 +548,6 @@ fn multiple_webhooks_notification_test() {
 			.handle_custom_message(set_webhook_request, client_node_id)
 			.unwrap();
 
-		// Consume WebhookRegistered event
-		let _ = service_node.liquidity_manager.next_event().unwrap();
 		// Consume SendWebhookNotification event for webhook_registered
 		let _ = service_node.liquidity_manager.next_event().unwrap();
 
@@ -675,8 +603,6 @@ fn multiple_webhooks_notification_test() {
 		.handle_custom_message(set_webhook_request, client_node_id)
 		.unwrap();
 
-	let _ = service_node.liquidity_manager.next_event().unwrap();
-
 	let notification_event = service_node.liquidity_manager.next_event().unwrap();
 	match notification_event {
 		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::SendWebhookNotification {
@@ -711,8 +637,6 @@ fn idempotency_set_webhook_test() {
 		.handle_custom_message(set_webhook_request, client_node_id)
 		.unwrap();
 
-	let _ = service_node.liquidity_manager.next_event().unwrap();
-
 	let notification_event = service_node.liquidity_manager.next_event().unwrap();
 	match notification_event {
 		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::SendWebhookNotification { .. }) => {},
@@ -743,17 +667,6 @@ fn idempotency_set_webhook_test() {
 		.liquidity_manager
 		.handle_custom_message(set_webhook_request_again, client_node_id)
 		.unwrap();
-
-	let webhook_registered_again_event = service_node.liquidity_manager.next_event().unwrap();
-	match webhook_registered_again_event {
-		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::WebhookRegistered {
-			no_change, ..
-		}) => {
-			// Second registration with same parameters should be a no_change
-			assert_eq!(no_change, true, "Second identical registration should have no_change=true");
-		},
-		_ => panic!("Unexpected event"),
-	}
 
 	assert!(
 		service_node.liquidity_manager.next_event().is_none(),
@@ -786,16 +699,6 @@ fn idempotency_set_webhook_test() {
 		.handle_custom_message(update_webhook_request, client_node_id)
 		.unwrap();
 
-	let webhook_updated_event = service_node.liquidity_manager.next_event().unwrap();
-	match webhook_updated_event {
-		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::WebhookRegistered {
-			no_change, ..
-		}) => {
-			assert_eq!(no_change, false, "Update with different URL should have no_change=false");
-		},
-		_ => panic!("Expected WebhookRegistered event for update"),
-	}
-
 	// For an update, a SendWebhookNotification event SHOULD be emitted
 	let notification_update_event = service_node.liquidity_manager.next_event().unwrap();
 	match notification_update_event {
@@ -825,7 +728,7 @@ fn replay_prevention_test() {
 	let request = get_lsps_message!(client_node, service_node_id);
 	service_node.liquidity_manager.handle_custom_message(request, client_node_id).unwrap();
 
-	let _ = service_node.liquidity_manager.next_event().unwrap();
+	// Consume initial SendWebhookNotification event
 	let _ = service_node.liquidity_manager.next_event().unwrap();
 
 	let response = get_lsps_message!(service_node, client_node_id);
@@ -880,8 +783,10 @@ fn stale_webhooks() {
 		.unwrap();
 	let req = get_lsps_message!(client_node, service_node_id);
 	service_node.liquidity_manager.handle_custom_message(req, client_node_id).unwrap();
+
+	// consume initial SendWebhookNotification
 	let _ = service_node.liquidity_manager.next_event().unwrap();
-	let _ = service_node.liquidity_manager.next_event().unwrap();
+
 	let resp = get_lsps_message!(service_node, client_node_id);
 	client_node.liquidity_manager.handle_custom_message(resp, service_node_id).unwrap();
 	let _ = client_node.liquidity_manager.next_event().unwrap();
@@ -890,13 +795,7 @@ fn stale_webhooks() {
 	let _ = client_handler.list_webhooks(service_node_id);
 	let list_req = get_lsps_message!(client_node, service_node_id);
 	service_node.liquidity_manager.handle_custom_message(list_req, client_node_id).unwrap();
-	let list_evt = service_node.liquidity_manager.next_event().unwrap();
-	match list_evt {
-		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::WebhooksListed { app_names, .. }) => {
-			assert_eq!(app_names, vec![app_name.clone()]);
-		},
-		_ => panic!("Expected WebhooksListed before prune"),
-	}
+
 	let list_resp = get_lsps_message!(service_node, client_node_id);
 	client_node.liquidity_manager.handle_custom_message(list_resp, service_node_id).unwrap();
 	let list_cli = client_node.liquidity_manager.next_event().unwrap();
@@ -915,13 +814,7 @@ fn stale_webhooks() {
 	let _ = client_handler.list_webhooks(service_node_id);
 	let list_req2 = get_lsps_message!(client_node, service_node_id);
 	service_node.liquidity_manager.handle_custom_message(list_req2, client_node_id).unwrap();
-	let list_evt2 = service_node.liquidity_manager.next_event().unwrap();
-	match list_evt2 {
-		LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::WebhooksListed { app_names, .. }) => {
-			assert!(app_names.is_empty(), "Expected no webhooks after prune");
-		},
-		_ => panic!("Expected WebhooksListed after prune"),
-	}
+
 	let list_resp2 = get_lsps_message!(service_node, client_node_id);
 	client_node.liquidity_manager.handle_custom_message(list_resp2, service_node_id).unwrap();
 	let list_cli2 = client_node.liquidity_manager.next_event().unwrap();
@@ -949,8 +842,7 @@ fn test_all_notifications() {
 	let set_req = get_lsps_message!(client_node, service_node_id);
 	service_node.liquidity_manager.handle_custom_message(set_req, client_node_id).unwrap();
 
-	// consume the WebhookRegistered event + initial SendWebhookNotification
-	let _ = service_node.liquidity_manager.next_event().unwrap();
+	// consume initial SendWebhookNotification
 	let _ = service_node.liquidity_manager.next_event().unwrap();
 
 	service_handler.notify_onion_message_incoming(client_node_id);
@@ -1007,8 +899,7 @@ fn test_tampered_notification() {
 	let set_req = get_lsps_message!(client_node, service_node_id);
 	service_node.liquidity_manager.handle_custom_message(set_req, client_node_id).unwrap();
 
-	// consume the WebhookRegistered event + initial SendWebhookNotification
-	let _ = service_node.liquidity_manager.next_event().unwrap();
+	// consume initial SendWebhookNotification
 	let _ = service_node.liquidity_manager.next_event().unwrap();
 
 	service_handler.notify_expiry_soon(client_node_id, 700000);
@@ -1059,8 +950,7 @@ fn test_bad_signature_notification() {
 	let set_req = get_lsps_message!(client_node, service_node_id);
 	service_node.liquidity_manager.handle_custom_message(set_req, client_node_id).unwrap();
 
-	// consume the WebhookRegistered event + initial SendWebhookNotification
-	let _ = service_node.liquidity_manager.next_event().unwrap();
+	// consume initial SendWebhookNotification
 	let _ = service_node.liquidity_manager.next_event().unwrap();
 
 	service_handler.notify_onion_message_incoming(client_node_id);
@@ -1112,8 +1002,7 @@ fn test_timestamp_notification_window_validation() {
 	let set_req = get_lsps_message!(client_node, service_node_id);
 	service_node.liquidity_manager.handle_custom_message(set_req, client_node_id).unwrap();
 
-	// consume the WebhookRegistered event + initial SendWebhookNotification
-	let _ = service_node.liquidity_manager.next_event().unwrap();
+	// consume initial SendWebhookNotification
 	let _ = service_node.liquidity_manager.next_event().unwrap();
 
 	service_handler.notify_onion_message_incoming(client_node_id);
@@ -1192,7 +1081,7 @@ fn no_replay_error_when_signature_storage_is_disabled() {
 	let request = get_lsps_message!(client_node, service_node_id);
 	service_node.liquidity_manager.handle_custom_message(request, client_node_id).unwrap();
 
-	let _ = service_node.liquidity_manager.next_event().unwrap();
+	// consume initial SendWebhookNotification
 	let _ = service_node.liquidity_manager.next_event().unwrap();
 
 	let response = get_lsps_message!(service_node, client_node_id);

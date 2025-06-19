@@ -95,12 +95,9 @@ pub struct LSPS5ServiceConfig {
 /// # Core Responsibilities
 /// - Handle incoming JSON-RPC requests:
 ///   - `lsps5.set_webhook` -> insert or replace a webhook, enforce [`max_webhooks_per_client`],
-///     emit [`LSPS5ServiceEvent::WebhookRegistered`], and send an initial
-///     [`lsps5.webhook_registered`] notification if new or changed.
-///   - `lsps5.list_webhooks` -> return all registered [`app_name`]s via response and
-///     [`LSPS5ServiceEvent::WebhooksListed`].
-///   - `lsps5.remove_webhook` -> delete a named webhook or return [`app_name_not_found`]
-///     error, emitting [`LSPS5ServiceEvent::WebhookRemoved`].
+/// and send an initial [`lsps5.webhook_registered`] notification if new or changed.
+///   - `lsps5.list_webhooks` -> return all registered [`app_name`]s via response.
+///   - `lsps5.remove_webhook` -> delete a named webhook or return [`app_name_not_found`] error.
 /// - Prune stale webhooks after a client has no open channels and no activity for at least
 /// [`MIN_WEBHOOK_RETENTION_DAYS`].
 /// - Rate-limit repeat notifications of the same method to a client by
@@ -118,9 +115,6 @@ pub struct LSPS5ServiceConfig {
 ///
 /// [`bLIP-55 / LSPS5`]: https://github.com/lightning/blips/pull/55/files
 /// [`max_webhooks_per_client`]: super::service::LSPS5ServiceConfig::max_webhooks_per_client
-/// [`LSPS5ServiceEvent::WebhookRegistered`]: super::event::LSPS5ServiceEvent::WebhookRegistered
-/// [`LSPS5ServiceEvent::WebhooksListed`]: super::event::LSPS5ServiceEvent::WebhooksListed
-/// [`LSPS5ServiceEvent::WebhookRemoved`]: super::event::LSPS5ServiceEvent::WebhookRemoved
 /// [`app_name_not_found`]: super::msgs::LSPS5ProtocolError::AppNameNotFound
 /// [`notification_cooldown_hours`]: super::service::LSPS5ServiceConfig::notification_cooldown_hours
 /// [`WebhookNotification`]: super::msgs::WebhookNotification
@@ -182,7 +176,6 @@ where
 		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId,
 		params: SetWebhookRequest,
 	) -> Result<(), LightningError> {
-		let event_queue_notifier = self.event_queue.notifier();
 		self.check_prune_stale_webhooks();
 
 		let mut webhooks = self.webhooks.lock().unwrap();
@@ -228,19 +221,11 @@ where
 
 		client_webhooks.insert(params.app_name.clone(), stored_webhook);
 
-		event_queue_notifier.enqueue(LSPS5ServiceEvent::WebhookRegistered {
-			counterparty_node_id,
-			app_name: params.app_name.clone(),
-			url: params.webhook.clone(),
-			request_id: request_id.clone(),
-			no_change,
-		});
-
 		if !no_change {
 			self.send_webhook_registered_notification(
 				counterparty_node_id,
-				params.app_name.clone(),
-				params.webhook.clone(),
+				params.app_name,
+				params.webhook,
 			);
 		}
 
@@ -261,7 +246,6 @@ where
 		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId,
 		_params: ListWebhooksRequest,
 	) -> Result<(), LightningError> {
-		let event_queue_notifier = self.event_queue.notifier();
 		self.check_prune_stale_webhooks();
 
 		let webhooks = self.webhooks.lock().unwrap();
@@ -272,13 +256,6 @@ where
 			.unwrap_or_else(Vec::new);
 
 		let max_webhooks = self.config.max_webhooks_per_client;
-
-		event_queue_notifier.enqueue(LSPS5ServiceEvent::WebhooksListed {
-			counterparty_node_id,
-			app_names: app_names.clone(),
-			max_webhooks,
-			request_id: request_id.clone(),
-		});
 
 		let response = ListWebhooksResponse { app_names, max_webhooks };
 		let msg = LSPS5Message::Response(request_id, LSPS5Response::ListWebhooks(response)).into();
@@ -291,7 +268,6 @@ where
 		&self, counterparty_node_id: PublicKey, request_id: LSPSRequestId,
 		params: RemoveWebhookRequest,
 	) -> Result<(), LightningError> {
-		let event_queue_notifier = self.event_queue.notifier();
 		self.check_prune_stale_webhooks();
 
 		let mut webhooks = self.webhooks.lock().unwrap();
@@ -299,17 +275,10 @@ where
 		if let Some(client_webhooks) = webhooks.get_mut(&counterparty_node_id) {
 			if client_webhooks.remove(&params.app_name).is_some() {
 				let response = RemoveWebhookResponse {};
-				let msg = LSPS5Message::Response(
-					request_id.clone(),
-					LSPS5Response::RemoveWebhook(response),
-				)
-				.into();
+				let msg =
+					LSPS5Message::Response(request_id, LSPS5Response::RemoveWebhook(response))
+						.into();
 				self.pending_messages.enqueue(&counterparty_node_id, msg);
-				event_queue_notifier.enqueue(LSPS5ServiceEvent::WebhookRemoved {
-					counterparty_node_id,
-					app_name: params.app_name,
-					request_id,
-				});
 
 				return Ok(());
 			}
