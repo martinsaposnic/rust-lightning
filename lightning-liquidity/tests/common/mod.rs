@@ -467,8 +467,8 @@ pub(crate) fn create_liquidity_node(
 		Arc::clone(&logger),
 	));
 	let liquidity_manager = Arc::new(LiquidityManager::new_with_custom_time_provider(
-		keys_manager.clone(),
-		channel_manager.clone(),
+		Arc::clone(&keys_manager),
+		Arc::clone(&channel_manager),
 		None::<Arc<dyn Filter + Send + Sync>>,
 		Some(chain_params.clone()),
 		service_config,
@@ -518,7 +518,7 @@ pub(crate) fn create_service_and_client_nodes(
 		network,
 		Some(service_config),
 		None,
-		time_provider.clone(),
+		Arc::clone(&time_provider),
 	);
 	let client_node = create_liquidity_node(
 		2,
@@ -526,7 +526,7 @@ pub(crate) fn create_service_and_client_nodes(
 		network,
 		None,
 		Some(client_config),
-		time_provider.clone(),
+		Arc::clone(&time_provider),
 	);
 
 	service_node

@@ -241,7 +241,7 @@ impl LSPSDateTime {
 	}
 
 	/// Returns the time in seconds since the unix epoch.
-	pub fn abs_diff(&self, other: Self) -> u64 {
+	pub fn abs_diff(&self, other: &Self) -> u64 {
 		self.0.timestamp().abs_diff(other.0.timestamp())
 	}
 

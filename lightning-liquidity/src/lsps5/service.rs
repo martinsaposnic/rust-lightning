@@ -60,6 +60,14 @@ struct StoredWebhook {
 pub trait TimeProvider {
 	/// Get the current time as a duration since the Unix epoch.
 	fn duration_since_epoch(&self) -> Duration;
+
+	// TODO: only on tests
+	/// Advance the time by a specified number of seconds.
+	fn advance_time(&self, _seconds: u64);
+
+	// TODO: only on tests
+	/// Rewind the time by a specified number of seconds.
+	fn rewind_time(&self, _seconds: u64);
 }
 
 /// Default time provider using the system clock.
@@ -72,6 +80,14 @@ impl TimeProvider for DefaultTimeProvider {
 	fn duration_since_epoch(&self) -> Duration {
 		use std::time::{SystemTime, UNIX_EPOCH};
 		SystemTime::now().duration_since(UNIX_EPOCH).expect("system time before Unix epoch")
+	}
+
+	fn advance_time(&self, _seconds: u64) {
+		// No op for non-mock implementations
+	}
+
+	fn rewind_time(&self, _seconds: u64) {
+		// No op for non-mock implementations
 	}
 }
 
@@ -163,7 +179,7 @@ where
 		let should_prune = {
 			let last_pruning = self.last_pruning.lock().unwrap();
 			last_pruning.as_ref().map_or(true, |last_time| {
-				now.abs_diff(last_time.clone()) > PRUNE_STALE_WEBHOOKS_INTERVAL_DAYS.as_secs()
+				now.abs_diff(&last_time) > PRUNE_STALE_WEBHOOKS_INTERVAL_DAYS.as_secs()
 			})
 		};
 
@@ -302,7 +318,7 @@ where
 		&self, client_node_id: PublicKey, app_name: LSPS5AppName, url: LSPS5WebhookUrl,
 	) {
 		let notification = WebhookNotification::webhook_registered();
-		self.send_notification(client_node_id, app_name.clone(), url.clone(), notification)
+		self.send_notification(client_node_id, app_name, url, notification)
 	}
 
 	/// Notify the LSP service that the client has one or more incoming payments pending.
@@ -385,7 +401,7 @@ where
 			if webhook
 				.last_notification_sent
 				.get(&notification.method)
-				.map(|last_sent| now.clone().abs_diff(last_sent.clone()))
+				.map(|last_sent| now.clone().abs_diff(&last_sent))
 				.map_or(true, |duration| duration >= cooldown_duration.as_secs())
 			{
 				webhook.last_notification_sent.insert(notification.method.clone(), now.clone());
@@ -444,7 +460,7 @@ where
 		webhooks.retain(|client_id, client_webhooks| {
 			if !self.client_has_open_channel(client_id) {
 				client_webhooks.retain(|_, webhook| {
-					now.abs_diff(webhook.last_used.clone()) < MIN_WEBHOOK_RETENTION_DAYS.as_secs()
+					now.abs_diff(&webhook.last_used) < MIN_WEBHOOK_RETENTION_DAYS.as_secs()
 				});
 				!client_webhooks.is_empty()
 			} else {
@@ -480,16 +496,14 @@ where
 			LSPS5Message::Request(request_id, request) => {
 				let res = match request {
 					LSPS5Request::SetWebhook(params) => {
-						self.handle_set_webhook(*counterparty_node_id, request_id.clone(), params)
+						self.handle_set_webhook(*counterparty_node_id, request_id, params)
 					},
 					LSPS5Request::ListWebhooks(params) => {
-						self.handle_list_webhooks(*counterparty_node_id, request_id.clone(), params)
+						self.handle_list_webhooks(*counterparty_node_id, request_id, params)
 					},
-					LSPS5Request::RemoveWebhook(params) => self.handle_remove_webhook(
-						*counterparty_node_id,
-						request_id.clone(),
-						params,
-					),
+					LSPS5Request::RemoveWebhook(params) => {
+						self.handle_remove_webhook(*counterparty_node_id, request_id, params)
+					},
 				};
 				res
 			},
