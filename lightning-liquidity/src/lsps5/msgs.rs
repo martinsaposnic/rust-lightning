@@ -259,7 +259,7 @@ pub struct LSPS5AppName(UntrustedString);
 impl LSPS5AppName {
 	/// Create a new LSPS5 app name.
 	pub fn new(app_name: UntrustedString) -> Result<Self, LSPS5Error> {
-		if app_name.to_string().chars().count() > MAX_APP_NAME_LENGTH {
+		if app_name.0.chars().count() > MAX_APP_NAME_LENGTH {
 			return Err(LSPS5ProtocolError::AppNameTooLong.into());
 		}
 		Ok(Self(app_name))
@@ -305,6 +305,9 @@ impl<'de> Deserialize<'de> for LSPS5AppName {
 		D: serde::Deserializer<'de>,
 	{
 		let s = String::deserialize(deserializer)?;
+		if s.chars().count() > MAX_APP_NAME_LENGTH {
+			return Err(serde::de::Error::custom("App name exceeds maximum length"));
+		}
 		Self::new(UntrustedString(s)).map_err(|e| serde::de::Error::custom(format!("{:?}", e)))
 	}
 }
@@ -328,8 +331,7 @@ pub struct LSPS5WebhookUrl(LSPSUrl);
 impl LSPS5WebhookUrl {
 	/// Create a new LSPS5 webhook URL.
 	pub fn new(url: UntrustedString) -> Result<Self, LSPS5Error> {
-		let raw_url = url.to_string();
-		if raw_url.len() > MAX_WEBHOOK_URL_LENGTH {
+		if url.0.len() > MAX_WEBHOOK_URL_LENGTH {
 			return Err(LSPS5ProtocolError::WebhookUrlTooLong.into());
 		}
 		let parsed_url = LSPSUrl::parse(url.0)?;
@@ -377,6 +379,9 @@ impl<'de> Deserialize<'de> for LSPS5WebhookUrl {
 		D: serde::Deserializer<'de>,
 	{
 		let s = String::deserialize(deserializer)?;
+		if s.len() > MAX_WEBHOOK_URL_LENGTH {
+			return Err(serde::de::Error::custom("Webhook URL exceeds maximum length"));
+		}
 		Self::new(UntrustedString(s)).map_err(|e| serde::de::Error::custom(format!("{:?}", e)))
 	}
 }

@@ -17,6 +17,7 @@ use crate::lsps5::msgs::{
 	LSPS5Message, LSPS5Request, LSPS5Response, ListWebhooksRequest, RemoveWebhookRequest,
 	SetWebhookRequest, WebhookNotification,
 };
+use crate::lsps5::service::DefaultTimeProvider;
 use crate::message_queue::MessageQueue;
 use crate::prelude::{new_hash_map, HashMap};
 use crate::sync::{Arc, Mutex, RwLock};
@@ -174,7 +175,7 @@ where
 	TP::Target: TimeProvider,
 {
 	/// Constructs an `LSPS5ClientHandler`.
-	pub(crate) fn new(
+	pub(crate) fn new_with_time_provider(
 		entropy_source: ES, pending_messages: Arc<MessageQueue>, pending_events: Arc<EventQueue>,
 		config: LSPS5ClientConfig, time_provider: TP,
 	) -> Self {
@@ -556,6 +557,27 @@ where
 	}
 }
 
+#[cfg(feature = "time")]
+impl<ES: Deref> LSPS5ClientHandler<ES, DefaultTimeProvider>
+where
+	ES::Target: EntropySource,
+{
+	/// Constructs a `LSPS5ClientHandler` using [`DefaultTimeProvider`].
+	#[allow(dead_code)]
+	pub(crate) fn new(
+		entropy_source: ES, pending_messages: Arc<MessageQueue>, pending_events: Arc<EventQueue>,
+		config: LSPS5ClientConfig,
+	) -> Self {
+		Self::new_with_time_provider(
+			entropy_source,
+			pending_messages,
+			pending_events,
+			config,
+			DefaultTimeProvider,
+		)
+	}
+}
+
 impl<ES: Deref, TP: Deref + Clone> LSPSProtocolMessageHandler for LSPS5ClientHandler<ES, TP>
 where
 	ES::Target: EntropySource,
@@ -577,16 +599,12 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		lsps0::ser::LSPSRequestId,
-		lsps5::{msgs::SetWebhookResponse, service::DefaultTimeProvider},
-		tests::utils::TestEntropy,
+		lsps0::ser::LSPSRequestId, lsps5::msgs::SetWebhookResponse, tests::utils::TestEntropy,
 	};
 	use bitcoin::{key::Secp256k1, secp256k1::SecretKey};
 
-	fn setup_test_client(
-		time_provider: Arc<dyn TimeProvider>,
-	) -> (
-		LSPS5ClientHandler<Arc<TestEntropy>, Arc<dyn TimeProvider>>,
+	fn setup_test_client() -> (
+		LSPS5ClientHandler<Arc<TestEntropy>, DefaultTimeProvider>,
 		Arc<MessageQueue>,
 		Arc<EventQueue>,
 		PublicKey,
@@ -600,7 +618,6 @@ mod tests {
 			Arc::clone(&message_queue),
 			Arc::clone(&event_queue),
 			LSPS5ClientConfig::default(),
-			time_provider,
 		);
 
 		let secp = Secp256k1::new();
@@ -614,7 +631,7 @@ mod tests {
 
 	#[test]
 	fn test_per_peer_state_isolation() {
-		let (client, _, _, peer_1, peer_2) = setup_test_client(Arc::new(DefaultTimeProvider));
+		let (client, _, _, peer_1, peer_2) = setup_test_client();
 
 		let req_id_1 = client
 			.set_webhook(peer_1, "test-app-1".to_string(), "https://example.com/hook1".to_string())
@@ -636,7 +653,7 @@ mod tests {
 
 	#[test]
 	fn test_pending_request_tracking() {
-		let (client, _, _, peer, _) = setup_test_client(Arc::new(DefaultTimeProvider));
+		let (client, _, _, peer, _) = setup_test_client();
 		const APP_NAME: &str = "test-app";
 		const WEBHOOK_URL: &str = "https://example.com/hook";
 		let lsps5_app_name = LSPS5AppName::from_string(APP_NAME.to_string()).unwrap();
@@ -669,7 +686,7 @@ mod tests {
 
 	#[test]
 	fn test_handle_response_clears_pending_state() {
-		let (client, _, _, peer, _) = setup_test_client(Arc::new(DefaultTimeProvider));
+		let (client, _, _, peer, _) = setup_test_client();
 
 		let req_id = client
 			.set_webhook(peer, "test-app".to_string(), "https://example.com/hook".to_string())
@@ -699,8 +716,8 @@ mod tests {
 
 	#[test]
 	fn test_cleanup_expired_responses() {
-		let (client, _, _, _, _) = setup_test_client(Arc::new(DefaultTimeProvider));
-		let time_provider = &client.time_provider;
+		let (client, _, _, _, _) = setup_test_client();
+		let time_provider = client.time_provider;
 		const OLD_APP_NAME: &str = "test-app-old";
 		const NEW_APP_NAME: &str = "test-app-new";
 		const WEBHOOK_URL: &str = "https://example.com/hook";
@@ -708,7 +725,7 @@ mod tests {
 		let lsps5_new_app_name = LSPS5AppName::from_string(NEW_APP_NAME.to_string()).unwrap();
 		let lsps5_webhook_url = LSPS5WebhookUrl::from_string(WEBHOOK_URL.to_string()).unwrap();
 		let now = time_provider.duration_since_epoch();
-		let mut peer_state = PeerState::new(Duration::from_secs(1800), Arc::clone(time_provider));
+		let mut peer_state = PeerState::new(Duration::from_secs(1800), time_provider);
 		peer_state.last_cleanup = Some(LSPSDateTime::new_from_duration_since_epoch(
 			now.checked_sub(Duration::from_secs(120)).unwrap(),
 		));
@@ -756,7 +773,7 @@ mod tests {
 
 	#[test]
 	fn test_unknown_request_id_handling() {
-		let (client, _message_queue, _, peer, _) = setup_test_client(Arc::new(DefaultTimeProvider));
+		let (client, _message_queue, _, peer, _) = setup_test_client();
 
 		let _valid_req = client
 			.set_webhook(peer, "test-app".to_string(), "https://example.com/hook".to_string())

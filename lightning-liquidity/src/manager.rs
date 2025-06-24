@@ -253,7 +253,7 @@ where
 
 		let lsps5_client_handler = client_config.as_ref().and_then(|config| {
 			config.lsps5_client_config.as_ref().map(|config| {
-				LSPS5ClientHandler::new(
+				LSPS5ClientHandler::new_with_time_provider(
 					entropy_source.clone(),
 					Arc::clone(&pending_messages),
 					Arc::clone(&pending_events),
@@ -271,7 +271,7 @@ where
 					supported_protocols.push(number);
 				}
 
-				return LSPS5ServiceHandler::new(
+				return LSPS5ServiceHandler::new_with_time_provider(
 					Arc::clone(&pending_events),
 					Arc::clone(&pending_messages),
 					channel_manager.clone(),

@@ -48,22 +48,17 @@ pub enum LSPS5ServiceEvent {
 	SendWebhookNotification {
 		/// Client node ID to be notified.
 		counterparty_node_id: PublicKey,
-		/// App name to be notified.
+		/// [`App name`] to be notified.
 		///
 		/// This identifies which webhook registration should be notified.
 		///
-		/// **Note**: The [`app_name`] must have been previously registered via [`lsps5.set_webhook`].
-		///
-		/// [`app_name`]: super::msgs::LSPS5AppName
-		/// [`lsps5.set_webhook`]: super::msgs::LSPS5Request::SetWebhook
+		/// [`App name`]: super::msgs::LSPS5AppName
 		app_name: LSPS5AppName,
-		/// URL that to be contacted.
+		/// URL to be called.
 		///
-		/// This is the webhook URL (HTTPS) provided by the client during registration.
+		/// This is the [`webhook URL`] provided by the client during registration.
 		///
-		/// **Note**: The URL must be a valid HTTPS URL that points to a public host.
-		///
-		/// [`url`]: super::msgs::LSPS5WebhookUrl
+		/// [`webhook URL`]: super::msgs::LSPS5WebhookUrl
 		url: LSPS5WebhookUrl,
 		/// Notification method with its parameters.
 		///
