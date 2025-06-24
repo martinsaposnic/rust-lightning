@@ -58,7 +58,7 @@ impl LSPSUrl {
 			.next_back()
 			.filter(|s| !s.is_empty())
 			.ok_or_else(|| (LSPS5ProtocolError::UrlParse))?;
-		println!("host_without_auth: {:?}", host_without_auth.chars());
+
 		if host_without_auth.is_empty()
 			|| host_without_auth
 				.chars()

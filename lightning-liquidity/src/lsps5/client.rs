@@ -558,7 +558,7 @@ where
 }
 
 #[cfg(feature = "time")]
-impl<ES: Deref> LSPS5ClientHandler<ES, DefaultTimeProvider>
+impl<ES: Deref> LSPS5ClientHandler<ES, Arc<DefaultTimeProvider>>
 where
 	ES::Target: EntropySource,
 {
@@ -573,7 +573,7 @@ where
 			pending_messages,
 			pending_events,
 			config,
-			DefaultTimeProvider,
+			Arc::new(DefaultTimeProvider),
 		)
 	}
 }
@@ -604,7 +604,7 @@ mod tests {
 	use bitcoin::{key::Secp256k1, secp256k1::SecretKey};
 
 	fn setup_test_client() -> (
-		LSPS5ClientHandler<Arc<TestEntropy>, DefaultTimeProvider>,
+		LSPS5ClientHandler<Arc<TestEntropy>, Arc<DefaultTimeProvider>>,
 		Arc<MessageQueue>,
 		Arc<EventQueue>,
 		PublicKey,
@@ -717,7 +717,7 @@ mod tests {
 	#[test]
 	fn test_cleanup_expired_responses() {
 		let (client, _, _, _, _) = setup_test_client();
-		let time_provider = client.time_provider;
+		let time_provider = &client.time_provider;
 		const OLD_APP_NAME: &str = "test-app-old";
 		const NEW_APP_NAME: &str = "test-app-new";
 		const WEBHOOK_URL: &str = "https://example.com/hook";
@@ -725,7 +725,10 @@ mod tests {
 		let lsps5_new_app_name = LSPS5AppName::from_string(NEW_APP_NAME.to_string()).unwrap();
 		let lsps5_webhook_url = LSPS5WebhookUrl::from_string(WEBHOOK_URL.to_string()).unwrap();
 		let now = time_provider.duration_since_epoch();
-		let mut peer_state = PeerState::new(Duration::from_secs(1800), time_provider);
+		let mut peer_state = PeerState::<Arc<DefaultTimeProvider>>::new(
+			Duration::from_secs(1800),
+			Arc::clone(time_provider),
+		);
 		peer_state.last_cleanup = Some(LSPSDateTime::new_from_duration_since_epoch(
 			now.checked_sub(Duration::from_secs(120)).unwrap(),
 		));

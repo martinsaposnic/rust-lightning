@@ -76,15 +76,6 @@ impl TimeProvider for DefaultTimeProvider {
 	}
 }
 
-#[cfg(feature = "time")]
-impl Deref for DefaultTimeProvider {
-	type Target = Self;
-
-	fn deref(&self) -> &Self {
-		self
-	}
-}
-
 /// Server-side configuration options for LSPS5 Webhook Registration.
 #[derive(Clone, Debug)]
 pub struct LSPS5ServiceConfig {
@@ -482,7 +473,7 @@ where
 }
 
 #[cfg(feature = "time")]
-impl<CM: Deref> LSPS5ServiceHandler<CM, DefaultTimeProvider>
+impl<CM: Deref> LSPS5ServiceHandler<CM, Arc<DefaultTimeProvider>>
 where
 	CM::Target: AChannelManager,
 {
@@ -497,7 +488,7 @@ where
 			pending_messages,
 			channel_manager,
 			config,
-			DefaultTimeProvider,
+			Arc::new(DefaultTimeProvider),
 		)
 	}
 }

@@ -29,19 +29,15 @@ pub enum LSPS5ServiceEvent {
 	/// via their registered webhook. The LSP must make an HTTP POST request to the
 	/// provided URL with the specified headers and notification content.
 	///
-	/// When this event occurs, the LSP should:
-	/// 1. Send an HTTP POST request to the specified webhook URL
-	/// 2. Include all provided headers in the request
-	/// 3. Send the JSON-serialized notification as the request body
-	/// 4. Handle any HTTP errors according to the LSP's retry policy
+	/// When this event occurs, the LSP should send an HTTP POST request to
+	/// the provided webhook URL with the given headers and notification.
+	/// If the HTTP request fails, the LSP may implement a retry policy according to its
+	/// implementation preferences, but must respect rate-limiting as defined in
+	/// [`notification_cooldown_hours`].
 	///
 	/// The notification is signed using the LSP's node ID to ensure authenticity
 	/// when received by the client. The client verifies this signature using
 	/// [`parse_webhook_notification`], which guards against replay attacks and tampering.
-	///
-	/// If the HTTP request fails, the LSP may implement a retry policy according to its
-	/// implementation preferences, but must respect rate-limiting as defined in
-	/// [`notification_cooldown_hours`].
 	///
 	/// [`parse_webhook_notification`]: super::client::LSPS5ClientHandler::parse_webhook_notification
 	/// [`notification_cooldown_hours`]: super::service::LSPS5ServiceConfig::notification_cooldown_hours
@@ -84,11 +80,9 @@ pub enum LSPS5ClientEvent {
 	/// of a webhook via [`lsps5.set_webhook`]. The client has received a successful
 	/// response with information about the total number of webhooks registered and limits.
 	///
-	/// When this event occurs, the client should:
-	/// 1. Update any UI to reflect the successful registration
-	/// 2. Store the webhook registration details if needed locally
-	/// 3. Prepare to receive notifications at the registered webhook URL
-	/// 4. Note that if `no_change` is `true`, the LSP did not send a test notification
+	/// When this event occurs, the client can update any UI or local
+	/// storage to reflect the registration. If `no_change` is `true`, the
+	/// LSP did not send a test notification.
 	///
 	/// The [`app_name`] and [`url`] both must respect maximum lengths of
 	/// [`MAX_APP_NAME_LENGTH`] and [`MAX_WEBHOOK_URL_LENGTH`] respectively, and the
@@ -124,11 +118,9 @@ pub enum LSPS5ClientEvent {
 	/// This event is triggered when the LSP rejects a webhook registration
 	/// via [`lsps5.set_webhook`]. This failure can occur for several reasons:
 	///
-	/// When this event occurs, the client should:
-	/// 1. Present an appropriate error message to the user
-	/// 2. Consider retry strategies based on the specific error
-	/// 3. If the error is due to reaching webhook limits, prompt the user to remove
-	///    unused webhooks before trying again
+	/// When this event occurs, surface the error and retry if appropriate.
+	/// If the webhook limit has been reached, unused
+	/// webhooks should be removed before trying again.
 	///
 	/// Common error cases include:
 	/// - The [`app_name`] exceeds [`MAX_APP_NAME_LENGTH`] (error [`AppNameTooLong`])
@@ -166,12 +158,7 @@ pub enum LSPS5ClientEvent {
 	/// [`lsps5.list_webhooks`] request. The client now has an up-to-date
 	/// list of all registered webhook app names.
 	///
-	/// When this event occurs, the client should:
-	/// 1. Update any UI to display the list of registered webhooks
-	/// 2. Update any local cache or state about registered webhooks
-	/// 3. Check if the number of webhooks approaches the maximum allowed limit
-	///
-	/// This listing only provides the app names; to get the URLs, the client would
+	/// This listing only provides the app names. To get the URLs, the client would
 	/// need to maintain its own records from registration events.
 	///
 	/// [`lsps5.list_webhooks`]: super::msgs::LSPS5Request::ListWebhooks
@@ -194,10 +181,8 @@ pub enum LSPS5ClientEvent {
 	/// [`lsps5.list_webhooks`] request. This is uncommon but might occur
 	/// due to temporary server issues or authentication problems.
 	///
-	/// When this event occurs, the client should:
-	/// 1. Present an appropriate error message to the user
-	/// 2. Consider implementing a retry mechanism with backoff
-	/// 3. If persistent, check connectivity to the LSP node
+	/// When this event occurs, display the error and retry or check
+	/// connectivity to the LSP as needed.
 	///
 	/// The error details provided can help diagnose the specific issue.
 	///
@@ -220,12 +205,6 @@ pub enum LSPS5ClientEvent {
 	/// has been deleted from the LSP's system and will no longer receive
 	/// notifications.
 	///
-	/// When this event occurs, the client should:
-	/// 1. Update any UI to reflect the webhook removal
-	/// 2. Remove the webhook from any local storage or cache
-	/// 3. Update counters or indicators showing the number of registered webhooks
-	/// 4. Take any application-specific cleanup actions for the removed webhook
-	///
 	/// After this event, the app_name is free to be reused for a new webhook
 	/// registration if desired.
 	///
@@ -246,13 +225,6 @@ pub enum LSPS5ClientEvent {
 	/// This event is triggered when the LSP rejects a webhook removal
 	/// via [`lsps5.remove_webhook`]. The most common scenario is attempting
 	/// to remove a webhook that doesn't exist or was already removed.
-	///
-	/// When this event occurs, the client should:
-	/// 1. Present an appropriate error message to the user
-	/// 2. If the error is [`AppNameNotFound`], update any local state to
-	///    reflect that the webhook does not exist on the server
-	/// 3. Consider refreshing the webhook list to ensure local state
-	///    matches server state
 	///
 	/// The most common error is [`LSPS5ProtocolError::AppNameNotFound`]
 	/// (error code [`LSPS5_APP_NAME_NOT_FOUND_ERROR_CODE`]), which indicates

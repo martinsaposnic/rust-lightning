@@ -142,37 +142,37 @@ pub(crate) fn is_bolt2_compliant(script: &Script, features: &InitFeatures) -> bo
 		//    * `OP_1` through `OP_16` inclusive, followed by a single push of 2 to 40 bytes
 		//     (witness program versions 1 through 16)
 		script.as_bytes()[0] != SEGWIT_V0.to_u8()
-	} else if features.supports_simple_close() && script.is_op_return() {
-		// 4. if (and only if) `option_simple_close` is negotiated:
-		let mut instruction_iter = script.instructions();
-		if let Some(Ok(Instruction::Op(opcode))) = instruction_iter.next() {
-			// * `OP_RETURN` followed by one of:
-			if opcode != OP_RETURN {
-				return false;
-			}
+	// } else if features.supports_simple_close() && script.is_op_return() {
+	// 	// 4. if (and only if) `option_simple_close` is negotiated:
+	// 	let mut instruction_iter = script.instructions();
+	// 	if let Some(Ok(Instruction::Op(opcode))) = instruction_iter.next() {
+	// 		// * `OP_RETURN` followed by one of:
+	// 		if opcode != OP_RETURN {
+	// 			return false;
+	// 		}
 
-			match instruction_iter.next() {
-				Some(Ok(Instruction::PushBytes(bytes))) => {
-					// * `6` to `75` inclusive followed by exactly that many bytes
-					if (6..=75).contains(&bytes.len()) {
-						return instruction_iter.next().is_none();
-					}
+	// 		match instruction_iter.next() {
+	// 			Some(Ok(Instruction::PushBytes(bytes))) => {
+	// 				// * `6` to `75` inclusive followed by exactly that many bytes
+	// 				if (6..=75).contains(&bytes.len()) {
+	// 					return instruction_iter.next().is_none();
+	// 				}
 
-					// `rust-bitcoin` interprets `OP_PUSHDATA1` as `Instruction::PushBytes`, having
-					// us land here in this case, too.
-					//
-					// * `76` followed by `76` to `80` followed by exactly that many bytes
-					if (76..=80).contains(&bytes.len()) {
-						return instruction_iter.next().is_none();
-					}
+	// 				// `rust-bitcoin` interprets `OP_PUSHDATA1` as `Instruction::PushBytes`, having
+	// 				// us land here in this case, too.
+	// 				//
+	// 				// * `76` followed by `76` to `80` followed by exactly that many bytes
+	// 				if (76..=80).contains(&bytes.len()) {
+	// 					return instruction_iter.next().is_none();
+	// 				}
 
-					false
-				},
-				_ => false,
-			}
-		} else {
-			false
-		}
+	// 				false
+	// 			},
+	// 			_ => false,
+	// 		}
+	// 	} else {
+	// 		false
+	// 	}
 	} else {
 		false
 	}
