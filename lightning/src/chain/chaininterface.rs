@@ -61,6 +61,10 @@ pub enum ConfirmationTarget {
 	/// Generally we have in the high tens to low hundreds of blocks to get our transaction
 	/// on-chain (it doesn't have to happen in the next few blocks!), but we shouldn't risk too low
 	/// a fee - this should be a relatively high priority feerate.
+	///
+	/// When requesting a feerate with this target, LDK will also provide the
+	/// block height by which the transaction must confirm to
+	/// [`FeeEstimator::get_est_sat_per_1000_weight_with_deadline`].
 	UrgentOnChainSweep,
 	/// This is the lowest feerate we will allow our channel counterparty to have in an anchor
 	/// channel in order to close the channel if a channel party goes away.
@@ -173,6 +177,18 @@ pub trait FeeEstimator {
 	///  * satoshis-per-byte * 250
 	///  * satoshis-per-kbyte / 4
 	fn get_est_sat_per_1000_weight(&self, confirmation_target: ConfirmationTarget) -> u32;
+
+	/// Like [`Self::get_est_sat_per_1000_weight`] but also provides the block height by
+	/// which the transaction must confirm.
+	///
+	/// When `confirmation_target` is [`ConfirmationTarget::UrgentOnChainSweep`] this will be
+	/// passed the block height at which the output may be claimed by the counterparty.
+	/// Otherwise, `confirmation_deadline_height` will be `None`.
+	fn get_est_sat_per_1000_weight_with_deadline(
+		&self, confirmation_target: ConfirmationTarget, _confirmation_deadline_height: Option<u32>,
+	) -> u32 {
+		self.get_est_sat_per_1000_weight(confirmation_target)
+	}
 }
 
 /// Minimum relay fee as required by bitcoin network mempool policy.
@@ -201,7 +217,19 @@ where
 	}
 
 	pub fn bounded_sat_per_1000_weight(&self, confirmation_target: ConfirmationTarget) -> u32 {
-		cmp::max(self.0.get_est_sat_per_1000_weight(confirmation_target), FEERATE_FLOOR_SATS_PER_KW)
+		self.bounded_sat_per_1000_weight_with_deadline(confirmation_target, None)
+	}
+
+	pub fn bounded_sat_per_1000_weight_with_deadline(
+		&self, confirmation_target: ConfirmationTarget, confirmation_deadline_height: Option<u32>,
+	) -> u32 {
+		cmp::max(
+			self.0.get_est_sat_per_1000_weight_with_deadline(
+				confirmation_target,
+				confirmation_deadline_height,
+			),
+			FEERATE_FLOOR_SATS_PER_KW,
+		)
 	}
 }
 
@@ -243,5 +271,40 @@ mod tests {
 			fee_estimator.bounded_sat_per_1000_weight(ConfirmationTarget::AnchorChannelFee),
 			sat_per_kw
 		);
+	}
+
+	#[test]
+	fn test_bounded_with_deadline_provided() {
+		use core::cell::Cell;
+
+		struct RecordingFeeEstimator {
+			sat_per_kw: u32,
+			seen_deadline: Cell<Option<u32>>,
+		}
+
+		impl FeeEstimator for RecordingFeeEstimator {
+			fn get_est_sat_per_1000_weight(&self, _: ConfirmationTarget) -> u32 {
+				self.sat_per_kw
+			}
+
+			fn get_est_sat_per_1000_weight_with_deadline(
+				&self, _: ConfirmationTarget, confirmation_deadline_height: Option<u32>,
+			) -> u32 {
+				self.seen_deadline.set(confirmation_deadline_height);
+				self.sat_per_kw
+			}
+		}
+
+		let recording_estimator = &RecordingFeeEstimator {
+			sat_per_kw: FEERATE_FLOOR_SATS_PER_KW + 2,
+			seen_deadline: Cell::new(None),
+		};
+		let bounded_estimator = LowerBoundedFeeEstimator::new(recording_estimator);
+		let deadline = 42;
+		bounded_estimator.bounded_sat_per_1000_weight_with_deadline(
+			ConfirmationTarget::UrgentOnChainSweep,
+			Some(deadline),
+		);
+		assert_eq!(recording_estimator.seen_deadline.get(), Some(deadline));
 	}
 }
