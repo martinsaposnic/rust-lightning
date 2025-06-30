@@ -4,7 +4,9 @@
 #![allow(unused_imports)]
 #![allow(unused_macros)]
 
+use bitcoin::secp256k1::PublicKey;
 use lightning::chain::Filter;
+use lightning::ln::types::ChannelId;
 use lightning::sign::{EntropySource, NodeSigner};
 
 use bitcoin::blockdata::constants::{genesis_block, ChainHash};
@@ -14,11 +16,15 @@ use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
 use lightning::chain::{chainmonitor, BestBlock, Confirm};
 use lightning::ln::channelmanager;
 use lightning::ln::channelmanager::ChainParameters;
+use lightning::ln::channelmanager::{FailureCode, InterceptId};
 use lightning::ln::functional_test_utils::*;
 use lightning::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, Init};
 use lightning::ln::peer_handler::{
 	IgnoringMessageHandler, MessageHandler, PeerManager, SocketDescriptor,
 };
+use lightning::util::errors::APIError;
+use lightning_liquidity::lsps2::service::LSPS2ChannelManager;
+use lightning_types::payment::PaymentHash;
 
 use lightning::onion_message::messenger::DefaultMessageRouter;
 use lightning::routing::gossip::{NetworkGraph, P2PGossipSync};
@@ -44,6 +50,97 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{env, fs};
+
+// Add the mock implementation before the Node struct
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum MockChannelManagerCall {
+	ForwardInterceptedHtlc {
+		intercept_id: InterceptId,
+		next_hop_channel_id: ChannelId,
+		next_node_id: PublicKey,
+		amt_to_forward_msat: u64,
+	},
+	FailInterceptedHtlc {
+		intercept_id: InterceptId,
+	},
+	FailHtlcBackwardsWithReason {
+		payment_hash: PaymentHash,
+		failure_reason: FailureCode,
+	},
+}
+
+#[derive(Clone)]
+pub(crate) struct MockChannelManager {
+	pub calls: Arc<Mutex<VecDeque<MockChannelManagerCall>>>,
+	pub forward_results: Arc<Mutex<VecDeque<Result<(), APIError>>>>,
+	pub fail_results: Arc<Mutex<VecDeque<Result<(), APIError>>>>,
+}
+
+impl MockChannelManager {
+	pub fn new() -> Self {
+		Self {
+			calls: Arc::new(Mutex::new(VecDeque::new())),
+			forward_results: Arc::new(Mutex::new(VecDeque::new())),
+			fail_results: Arc::new(Mutex::new(VecDeque::new())),
+		}
+	}
+
+	pub fn expect_forward_result(&self, result: Result<(), APIError>) {
+		self.forward_results.lock().unwrap().push_back(result);
+	}
+
+	pub fn expect_fail_result(&self, result: Result<(), APIError>) {
+		self.fail_results.lock().unwrap().push_back(result);
+	}
+
+	pub fn get_calls(&self) -> Vec<MockChannelManagerCall> {
+		self.calls.lock().unwrap().drain(..).collect()
+	}
+
+	pub fn assert_no_calls(&self) {
+		let calls = self.calls.lock().unwrap();
+		assert!(calls.is_empty(), "Expected no calls, but got: {:?}", *calls);
+	}
+
+	pub fn assert_call_count(&self, expected: usize) {
+		let calls = self.calls.lock().unwrap();
+		assert_eq!(calls.len(), expected, "Expected {} calls, but got: {:?}", expected, *calls);
+	}
+}
+
+impl LSPS2ChannelManager for MockChannelManager {
+	fn forward_intercepted_htlc(
+		&self, intercept_id: InterceptId, next_hop_channel_id: &ChannelId, next_node_id: PublicKey,
+		amt_to_forward_msat: u64,
+	) -> Result<(), APIError> {
+		self.calls.lock().unwrap().push_back(MockChannelManagerCall::ForwardInterceptedHtlc {
+			intercept_id,
+			next_hop_channel_id: *next_hop_channel_id,
+			next_node_id,
+			amt_to_forward_msat,
+		});
+
+		self.forward_results.lock().unwrap().pop_front().unwrap_or(Ok(()))
+	}
+
+	fn fail_intercepted_htlc(&self, intercept_id: InterceptId) -> Result<(), APIError> {
+		self.calls
+			.lock()
+			.unwrap()
+			.push_back(MockChannelManagerCall::FailInterceptedHtlc { intercept_id });
+
+		self.fail_results.lock().unwrap().pop_front().unwrap_or(Ok(()))
+	}
+
+	fn fail_htlc_backwards_with_reason(
+		&self, payment_hash: &PaymentHash, failure_reason: FailureCode,
+	) {
+		self.calls.lock().unwrap().push_back(MockChannelManagerCall::FailHtlcBackwardsWithReason {
+			payment_hash: *payment_hash,
+			failure_reason,
+		});
+	}
+}
 
 pub(crate) struct TestEntropy {}
 impl EntropySource for TestEntropy {
@@ -404,6 +501,7 @@ pub(crate) fn create_liquidity_node(
 	i: usize, persist_dir: &str, network: Network, service_config: Option<LiquidityServiceConfig>,
 	client_config: Option<LiquidityClientConfig>,
 ) -> Node {
+	let mock_cm = Arc::new(MockChannelManager::new());
 	let tx_broadcaster = Arc::new(test_utils::TestBroadcaster::new(network));
 	let fee_estimator = Arc::new(test_utils::TestFeeEstimator::new(253));
 	let logger = Arc::new(test_utils::TestLogger::with_id(format!("node {}", i)));
@@ -458,7 +556,7 @@ pub(crate) fn create_liquidity_node(
 
 	let liquidity_manager = Arc::new(LiquidityManager::new(
 		Arc::clone(&keys_manager),
-		Arc::clone(&channel_manager),
+		Arc::clone(&mock_cm) as Arc<dyn LSPS2ChannelManager>,
 		None::<Arc<dyn Filter + Send + Sync>>,
 		Some(chain_params),
 		service_config,

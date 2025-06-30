@@ -78,7 +78,7 @@ pub trait ALiquidityManager {
 	/// A type that may be dereferenced to [`Self::EntropySource`].
 	type ES: Deref<Target = Self::EntropySource> + Clone;
 	/// A type implementing [`AChannelManager`]
-	type AChannelManager: AChannelManager + ?Sized;
+	type AChannelManager: AChannelManager + Sized;
 	/// A type that may be dereferenced to [`Self::AChannelManager`].
 	type CM: Deref<Target = Self::AChannelManager> + Clone;
 	/// A type implementing [`Filter`].
@@ -93,7 +93,7 @@ impl<ES: Deref + Clone, CM: Deref + Clone, C: Deref + Clone> ALiquidityManager
 	for LiquidityManager<ES, CM, C>
 where
 	ES::Target: EntropySource,
-	CM::Target: AChannelManager,
+	CM::Target: AChannelManager + Sized,
 	C::Target: Filter,
 {
 	type EntropySource = ES::Target;
@@ -129,7 +129,7 @@ where
 pub struct LiquidityManager<ES: Deref + Clone, CM: Deref + Clone, C: Deref + Clone>
 where
 	ES::Target: EntropySource,
-	CM::Target: AChannelManager,
+	CM::Target: AChannelManager + Sized,
 	C::Target: Filter,
 {
 	pending_messages: Arc<MessageQueue>,
@@ -153,7 +153,7 @@ where
 impl<ES: Deref + Clone, CM: Deref + Clone, C: Deref + Clone> LiquidityManager<ES, CM, C>
 where
 	ES::Target: EntropySource,
-	CM::Target: AChannelManager,
+	CM::Target: AChannelManager + Sized,
 	C::Target: Filter,
 {
 	/// Constructor for the [`LiquidityManager`].
@@ -433,7 +433,7 @@ impl<ES: Deref + Clone + Clone, CM: Deref + Clone, C: Deref + Clone> CustomMessa
 	for LiquidityManager<ES, CM, C>
 where
 	ES::Target: EntropySource,
-	CM::Target: AChannelManager,
+	CM::Target: AChannelManager + Sized,
 	C::Target: Filter,
 {
 	type CustomMessage = RawLSPSMessage;
@@ -454,7 +454,7 @@ impl<ES: Deref + Clone, CM: Deref + Clone, C: Deref + Clone> CustomMessageHandle
 	for LiquidityManager<ES, CM, C>
 where
 	ES::Target: EntropySource,
-	CM::Target: AChannelManager,
+	CM::Target: AChannelManager + Sized,
 	C::Target: Filter,
 {
 	fn handle_custom_message(
@@ -565,7 +565,7 @@ where
 impl<ES: Deref + Clone, CM: Deref + Clone, C: Deref + Clone> Listen for LiquidityManager<ES, CM, C>
 where
 	ES::Target: EntropySource,
-	CM::Target: AChannelManager,
+	CM::Target: AChannelManager + Sized,
 	C::Target: Filter,
 {
 	fn filtered_block_connected(
@@ -602,7 +602,7 @@ where
 impl<ES: Deref + Clone, CM: Deref + Clone, C: Deref + Clone> Confirm for LiquidityManager<ES, CM, C>
 where
 	ES::Target: EntropySource,
-	CM::Target: AChannelManager,
+	CM::Target: AChannelManager + Sized,
 	C::Target: Filter,
 {
 	fn transactions_confirmed(

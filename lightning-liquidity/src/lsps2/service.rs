@@ -56,6 +56,47 @@ const MAX_PENDING_REQUESTS_PER_PEER: usize = 10;
 const MAX_TOTAL_PENDING_REQUESTS: usize = 1000;
 const MAX_TOTAL_PEERS: usize = 100000;
 
+/// A trait that defines the channel manager interface needed by LSPS2 service
+pub trait LSPS2ChannelManager: Sized {
+	/// TODO
+	fn forward_intercepted_htlc(
+		&self, intercept_id: InterceptId, next_hop_channel_id: &ChannelId, next_node_id: PublicKey,
+		amt_to_forward_msat: u64,
+	) -> Result<(), APIError>;
+
+	/// TODO
+	fn fail_intercepted_htlc(&self, intercept_id: InterceptId) -> Result<(), APIError>;
+
+	/// TODO
+	fn fail_htlc_backwards_with_reason(
+		&self, payment_hash: &PaymentHash, failure_reason: FailureCode,
+	);
+}
+
+impl<T: AChannelManager> LSPS2ChannelManager for T {
+	fn forward_intercepted_htlc(
+		&self, intercept_id: InterceptId, next_hop_channel_id: &ChannelId, next_node_id: PublicKey,
+		amt_to_forward_msat: u64,
+	) -> Result<(), APIError> {
+		self.get_cm().forward_intercepted_htlc(
+			intercept_id,
+			next_hop_channel_id,
+			next_node_id,
+			amt_to_forward_msat,
+		)
+	}
+
+	fn fail_intercepted_htlc(&self, intercept_id: InterceptId) -> Result<(), APIError> {
+		self.get_cm().fail_intercepted_htlc(intercept_id)
+	}
+
+	fn fail_htlc_backwards_with_reason(
+		&self, payment_hash: &PaymentHash, failure_reason: FailureCode,
+	) {
+		self.get_cm().fail_htlc_backwards_with_reason(payment_hash, failure_reason)
+	}
+}
+
 /// Server-side configuration options for JIT channels.
 #[derive(Clone, Debug)]
 pub struct LSPS2ServiceConfig {
@@ -535,7 +576,7 @@ macro_rules! get_or_insert_peer_state_entry {
 /// The main object allowing to send and receive bLIP-52 / LSPS2 messages.
 pub struct LSPS2ServiceHandler<CM: Deref>
 where
-	CM::Target: AChannelManager,
+	CM::Target: LSPS2ChannelManager + Sized,
 {
 	channel_manager: CM,
 	pending_messages: Arc<MessageQueue>,
@@ -549,7 +590,7 @@ where
 
 impl<CM: Deref> LSPS2ServiceHandler<CM>
 where
-	CM::Target: AChannelManager,
+	CM::Target: LSPS2ChannelManager + Sized,
 {
 	/// Constructs a `LSPS2ServiceHandler`.
 	pub(crate) fn new(
@@ -817,7 +858,7 @@ where
 								event_queue_notifier.enqueue(event);
 							},
 							Ok(Some(HTLCInterceptedAction::ForwardHTLC(channel_id))) => {
-								self.channel_manager.get_cm().forward_intercepted_htlc(
+								self.channel_manager.forward_intercepted_htlc(
 									intercept_id,
 									&channel_id,
 									*counterparty_node_id,
@@ -834,7 +875,7 @@ where
 								for (intercept_id, amount_to_forward_msat) in
 									amounts_to_forward_msat
 								{
-									self.channel_manager.get_cm().forward_intercepted_htlc(
+									self.channel_manager.forward_intercepted_htlc(
 										intercept_id,
 										&channel_id,
 										*counterparty_node_id,
@@ -844,9 +885,7 @@ where
 							},
 							Ok(None) => {},
 							Err(e) => {
-								self.channel_manager
-									.get_cm()
-									.fail_intercepted_htlc(intercept_id)?;
+								self.channel_manager.fail_intercepted_htlc(intercept_id)?;
 								peer_state
 									.outbound_channels_by_intercept_scid
 									.remove(&intercept_scid);
@@ -905,14 +944,12 @@ where
 										for (intercept_id, amount_to_forward_msat) in
 											amounts_to_forward_msat
 										{
-											self.channel_manager
-												.get_cm()
-												.forward_intercepted_htlc(
-													intercept_id,
-													&channel_id,
-													*counterparty_node_id,
-													amount_to_forward_msat,
-												)?;
+											self.channel_manager.forward_intercepted_htlc(
+												intercept_id,
+												&channel_id,
+												*counterparty_node_id,
+												amount_to_forward_msat,
+											)?;
 										}
 									},
 									Ok(None) => {},
@@ -961,7 +998,7 @@ where
 							match jit_channel.payment_forwarded() {
 								Ok(Some(ForwardHTLCsAction(channel_id, htlcs))) => {
 									for htlc in htlcs {
-										self.channel_manager.get_cm().forward_intercepted_htlc(
+										self.channel_manager.forward_intercepted_htlc(
 											htlc.intercept_id,
 											&channel_id,
 											*counterparty_node_id,
@@ -1102,7 +1139,7 @@ where
 		{
 			let intercepted_htlcs = payment_queue.clear();
 			for htlc in intercepted_htlcs {
-				self.channel_manager.get_cm().fail_htlc_backwards_with_reason(
+				self.channel_manager.fail_htlc_backwards_with_reason(
 					&htlc.payment_hash,
 					FailureCode::TemporaryNodeFailure,
 				);
@@ -1154,7 +1191,7 @@ where
 								for (intercept_id, amount_to_forward_msat) in
 									amounts_to_forward_msat
 								{
-									self.channel_manager.get_cm().forward_intercepted_htlc(
+									self.channel_manager.forward_intercepted_htlc(
 										intercept_id,
 										&channel_id,
 										*counterparty_node_id,
@@ -1471,7 +1508,7 @@ where
 
 impl<CM: Deref> LSPSProtocolMessageHandler for LSPS2ServiceHandler<CM>
 where
-	CM::Target: AChannelManager,
+	CM::Target: LSPS2ChannelManager + Sized,
 {
 	type ProtocolMessage = LSPS2Message;
 	const PROTOCOL_NUMBER: Option<u16> = Some(2);
