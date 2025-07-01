@@ -877,55 +877,71 @@ where
 	pub fn htlc_handling_failed(
 		&self, failure_type: HTLCHandlingFailureType,
 	) -> Result<(), APIError> {
-		if let HTLCHandlingFailureType::Forward { channel_id, .. } = failure_type {
-			let peer_by_channel_id = self.peer_by_channel_id.read().unwrap();
-			if let Some(counterparty_node_id) = peer_by_channel_id.get(&channel_id) {
+		let (counterparty_node_id, intercept_scid) = match failure_type {
+			HTLCHandlingFailureType::Forward { channel_id, .. } => {
+				let peer_by_channel_id = self.peer_by_channel_id.read().unwrap();
 				let outer_state_lock = self.per_peer_state.read().unwrap();
-				match outer_state_lock.get(counterparty_node_id) {
-					Some(inner_state_lock) => {
-						let mut peer_state = inner_state_lock.lock().unwrap();
-						if let Some(intercept_scid) =
-							peer_state.intercept_scid_by_channel_id.get(&channel_id).copied()
-						{
-							if let Some(jit_channel) = peer_state
-								.outbound_channels_by_intercept_scid
-								.get_mut(&intercept_scid)
-							{
-								match jit_channel.htlc_handling_failed() {
-									Ok(Some(ForwardPaymentAction(
-										channel_id,
-										FeePayment { opening_fee_msat, htlcs },
-									))) => {
-										let amounts_to_forward_msat =
-											calculate_amount_to_forward_per_htlc(
-												&htlcs,
-												opening_fee_msat,
-											);
 
-										for (intercept_id, amount_to_forward_msat) in
-											amounts_to_forward_msat
-										{
-											self.channel_manager
-												.get_cm()
-												.forward_intercepted_htlc(
-													intercept_id,
-													&channel_id,
-													*counterparty_node_id,
-													amount_to_forward_msat,
-												)?;
-										}
-									},
-									Ok(None) => {},
-									Err(e) => {
-										return Err(APIError::APIMisuseError {
-											err: format!("Unable to fail HTLC: {}.", e.err),
-										});
-									},
-								}
+				let result = peer_by_channel_id.get(&channel_id).and_then(|node_id| {
+					outer_state_lock.get(node_id).and_then(|inner_lock| {
+						inner_lock
+							.lock()
+							.unwrap()
+							.intercept_scid_by_channel_id
+							.get(&channel_id)
+							.map(|scid| (*node_id, *scid))
+					})
+				});
+
+				if let Some((node_id, scid)) = result {
+					(Some(node_id), Some(scid))
+				} else {
+					(None, None)
+				}
+			},
+			HTLCHandlingFailureType::UnknownNextHop { requested_forward_scid }
+			| HTLCHandlingFailureType::InvalidForward { requested_forward_scid } => {
+				let peer_by_intercept_scid = self.peer_by_intercept_scid.read().unwrap();
+				(
+					peer_by_intercept_scid.get(&requested_forward_scid).copied(),
+					Some(requested_forward_scid),
+				)
+			},
+			_ => (None, None),
+		};
+
+		if let (Some(counterparty_node_id), Some(intercept_scid)) =
+			(counterparty_node_id, intercept_scid)
+		{
+			let outer_state_lock = self.per_peer_state.read().unwrap();
+			if let Some(inner_state_lock) = outer_state_lock.get(&counterparty_node_id) {
+				let mut peer_state = inner_state_lock.lock().unwrap();
+				if let Some(jit_channel) =
+					peer_state.outbound_channels_by_intercept_scid.get_mut(&intercept_scid)
+				{
+					match jit_channel.htlc_handling_failed() {
+						Ok(Some(ForwardPaymentAction(
+							channel_id,
+							FeePayment { opening_fee_msat, htlcs },
+						))) => {
+							let amounts_to_forward_msat =
+								calculate_amount_to_forward_per_htlc(&htlcs, opening_fee_msat);
+							for (intercept_id, amount_to_forward_msat) in amounts_to_forward_msat {
+								self.channel_manager.get_cm().forward_intercepted_htlc(
+									intercept_id,
+									&channel_id,
+									counterparty_node_id,
+									amount_to_forward_msat,
+								)?;
 							}
-						}
-					},
-					None => {},
+						},
+						Ok(None) => {},
+						Err(e) => {
+							return Err(APIError::APIMisuseError {
+								err: format!("Unable to fail HTLC: {}.", e.err),
+							});
+						},
+					}
 				}
 			}
 		}

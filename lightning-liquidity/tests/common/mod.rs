@@ -5,6 +5,7 @@
 #![allow(unused_macros)]
 
 use lightning::chain::Filter;
+use lightning::events::Event;
 use lightning::sign::{EntropySource, NodeSigner};
 
 use bitcoin::blockdata::constants::{genesis_block, ChainHash};
@@ -675,4 +676,8 @@ fn advance_chain(node: &mut Node, num_blocks: u32) {
 			node.chain_monitor.best_block_updated(&header, height);
 		}
 	}
+}
+
+pub(crate) fn get_ldk_events(node: &Node) -> Vec<Event> {
+	node.channel_manager.get_and_clear_pending_events()
 }

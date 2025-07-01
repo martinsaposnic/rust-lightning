@@ -5,6 +5,7 @@ mod common;
 use common::create_service_and_client_nodes;
 use common::{get_lsps_message, Node};
 
+use lightning::ln::functional_test_utils::expect_channel_pending_event;
 use lightning_liquidity::events::LiquidityEvent;
 use lightning_liquidity::lsps0::ser::LSPSDateTime;
 use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
@@ -817,4 +818,118 @@ fn opening_fee_params_menu_is_sorted_by_spec() {
 	} else {
 		panic!("Unexpected event");
 	}
+}
+
+#[test]
+fn full_flow() {
+	let (service_node_id, client_node_id, service_node, client_node, _) =
+		setup_test_lsps2("channel_open_failed");
+
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+	let client_handler = client_node.liquidity_manager.lsps2_client_handler().unwrap();
+
+	let get_info_request_id = client_handler.request_opening_params(service_node_id, None);
+	let get_info_request = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(get_info_request, client_node_id).unwrap();
+
+	let _get_info_event = service_node.liquidity_manager.next_event().unwrap();
+
+	let raw_opening_params = LSPS2RawOpeningFeeParams {
+		min_fee_msat: 100,
+		proportional: 21,
+		valid_until: LSPSDateTime::from_str("2035-05-20T08:30:45Z").unwrap(),
+		min_lifetime: 144,
+		max_client_to_self_delay: 128,
+		min_payment_size_msat: 1,
+		max_payment_size_msat: 100_000_000,
+	};
+	service_handler
+		.opening_fee_params_generated(
+			&client_node_id,
+			get_info_request_id.clone(),
+			vec![raw_opening_params],
+		)
+		.unwrap();
+
+	let get_info_response = get_lsps_message!(service_node, client_node_id);
+	client_node
+		.liquidity_manager
+		.handle_custom_message(get_info_response, service_node_id)
+		.unwrap();
+
+	let opening_fee_params = match client_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
+			opening_fee_params_menu,
+			..
+		}) => opening_fee_params_menu.first().unwrap().clone(),
+		_ => panic!("Unexpected event"),
+	};
+
+	let payment_size_msat = Some(1_000_000);
+	let buy_request_id = client_handler
+		.select_opening_params(service_node_id, payment_size_msat, opening_fee_params.clone())
+		.unwrap();
+	let buy_request = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(buy_request, client_node_id).unwrap();
+
+	let _buy_event = service_node.liquidity_manager.next_event().unwrap();
+	let user_channel_id = 42;
+	let cltv_expiry_delta = 144;
+	let intercept_scid = service_node.channel_manager.get_intercept_scid();
+	let client_trusts_lsp = true;
+
+	service_handler
+		.invoice_parameters_generated(
+			&client_node_id,
+			buy_request_id.clone(),
+			intercept_scid,
+			cltv_expiry_delta,
+			client_trusts_lsp,
+			user_channel_id,
+		)
+		.unwrap();
+
+	let buy_response = get_lsps_message!(service_node, client_node_id);
+	client_node.liquidity_manager.handle_custom_message(buy_response, service_node_id).unwrap();
+	let _invoice_params_event = client_node.liquidity_manager.next_event().unwrap();
+
+	let htlc_amount_msat = 1_000_000;
+	let intercept_id = InterceptId([0; 32]);
+	let payment_hash = PaymentHash([1; 32]);
+
+	// This should trigger an OpenChannel event
+	service_handler
+		.htlc_intercepted(intercept_scid, intercept_id, htlc_amount_msat, payment_hash)
+		.unwrap();
+
+	let _ = match service_node.liquidity_manager.next_event().unwrap() {
+		LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
+			their_network_key,
+			amt_to_forward_msat,
+			user_channel_id: channel_id,
+			intercept_scid: scid,
+			..
+		}) => {
+			assert_eq!(channel_id, user_channel_id);
+			assert_eq!(scid, intercept_scid);
+
+			let _ = service_node
+				.channel_manager
+				.create_channel(
+					their_network_key,
+					amt_to_forward_msat,
+					0,
+					user_channel_id,
+					None,
+					None,
+				)
+				.unwrap();
+		},
+		_ => panic!("Expected OpenChannel event"),
+	};
+
+	expect_channel_pending_event!(service_node, client_node.node_id());
+	expect_channel_ready_event!(service_node, client_node.node_id());
+	expect_channel_pending_event!(client_node, service_node.node_id());
+	expect_channel_ready_event!(client_node, service_node.node_id());
 }
