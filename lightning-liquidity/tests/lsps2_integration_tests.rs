@@ -5,7 +5,10 @@ mod common;
 use common::create_service_and_client_nodes;
 use common::{get_lsps_message, Node};
 
-use lightning::ln::functional_test_utils::expect_channel_pending_event;
+use lightning::events::Event;
+use lightning::events::HTLCHandlingFailureType;
+use lightning::ln::functional_test_utils::{expect_payment_sent, send_payment};
+use lightning::ln::types::ChannelId;
 use lightning_liquidity::events::LiquidityEvent;
 use lightning_liquidity::lsps0::ser::LSPSDateTime;
 use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
@@ -36,6 +39,31 @@ use std::time::Duration;
 
 const MAX_PENDING_REQUESTS_PER_PEER: usize = 10;
 const MAX_TOTAL_PENDING_REQUESTS: usize = 1000;
+
+fn expect_channel_pending_event(
+	node: &Node, expected_counterparty_node_id: &PublicKey,
+) -> ChannelId {
+	let events = common::get_ldk_events(node);
+	assert_eq!(events.len(), 1);
+	match events[0] {
+		Event::ChannelPending { ref channel_id, ref counterparty_node_id, .. } => {
+			assert_eq!(*counterparty_node_id, *expected_counterparty_node_id);
+			*channel_id
+		},
+		_ => panic!("Unexpected event"),
+	}
+}
+
+fn expect_channel_ready_event(node: &Node, expected_counterparty_node_id: &PublicKey) {
+	let events = common::get_ldk_events(node);
+	assert_eq!(events.len(), 1);
+	match events[0] {
+		Event::ChannelReady { ref counterparty_node_id, .. } => {
+			assert_eq!(*counterparty_node_id, *expected_counterparty_node_id);
+		},
+		_ => panic!("Unexpected event"),
+	}
+}
 
 fn setup_test_lsps2(
 	persist_dir: &str,
@@ -924,12 +952,27 @@ fn full_flow() {
 					None,
 				)
 				.unwrap();
+
+			let channel_id = expect_channel_pending_event(&service_node, &client_node_id);
+			expect_channel_ready_event(&service_node, &&client_node_id);
+			expect_channel_pending_event(&client_node, &service_node_id);
+			expect_channel_ready_event(&client_node, &service_node_id);
+
+			// Notify the service that the channel is ready so it can forward payments.
+			service_handler.channel_ready(user_channel_id, &channel_id, &client_node_id).unwrap();
+
+			// Simulate a failure while forwarding the intercepted HTLC.
+			let failure_type =
+				HTLCHandlingFailureType::Forward { node_id: Some(client_node_id), channel_id };
+			service_handler.htlc_handling_failed(failure_type).unwrap();
 		},
 		_ => panic!("Expected OpenChannel event"),
 	};
 
-	expect_channel_pending_event!(service_node, client_node.node_id());
-	expect_channel_ready_event!(service_node, client_node.node_id());
-	expect_channel_pending_event!(client_node, service_node.node_id());
-	expect_channel_ready_event!(client_node, service_node.node_id());
+	// // Verify that the newly opened channel can still process payments.
+	// let amount_msat = 50_000;
+	// let (payment_preimage, payment_hash, _, _) =
+	// 	send_payment(&service_node, &[&client_node], amount_msat);
+	// expect_payment_sent!(service_node, payment_preimage);
+	// expect_payment_claimed!(client_node, payment_hash, amount_msat);
 }
