@@ -114,7 +114,7 @@ type PGS = Arc<
 >;
 
 pub(crate) struct Node {
-	pub(crate) channel_manager: Arc<ChannelManager>,
+	pub(crate) node: Arc<ChannelManager>,
 	pub(crate) keys_manager: Arc<KeysManager>,
 	pub(crate) p2p_gossip_sync: PGS,
 	pub(crate) peer_manager: Arc<
@@ -478,7 +478,7 @@ pub(crate) fn create_liquidity_node(
 		PeerManager::new(msg_handler, 0, &seed, Arc::clone(&logger), Arc::clone(&keys_manager));
 
 	Node {
-		channel_manager,
+		node: channel_manager,
 		keys_manager,
 		p2p_gossip_sync,
 		peer_manager: Arc::new(peer_manager),
@@ -504,11 +504,11 @@ pub(crate) fn create_service_and_client_nodes(
 	let client_node = create_liquidity_node(2, &persist_dir, network, None, Some(client_config));
 
 	service_node
-		.channel_manager
+		.node
 		.peer_connected(
-			client_node.channel_manager.get_our_node_id(),
+			client_node.node.get_our_node_id(),
 			&Init {
-				features: client_node.channel_manager.init_features(),
+				features: client_node.node.init_features(),
 				networks: None,
 				remote_network_address: None,
 			},
@@ -516,11 +516,11 @@ pub(crate) fn create_service_and_client_nodes(
 		)
 		.unwrap();
 	client_node
-		.channel_manager
+		.node
 		.peer_connected(
-			service_node.channel_manager.get_our_node_id(),
+			service_node.node.get_our_node_id(),
 			&Init {
-				features: service_node.channel_manager.init_features(),
+				features: service_node.node.init_features(),
 				networks: None,
 				remote_network_address: None,
 			},
@@ -541,13 +541,13 @@ macro_rules! open_channel {
 		$node_a
 			.node
 			.funding_transaction_generated(
-				&temporary_channel_id,
-				&$node_b.node.get_our_node_id(),
+				temporary_channel_id,
+				$node_b.node.get_our_node_id(),
 				tx.clone(),
 			)
 			.unwrap();
 		$node_b.node.handle_funding_created(
-			&$node_a.node.get_our_node_id(),
+			$node_a.node.get_our_node_id(),
 			&get_event_msg!(
 				$node_a,
 				MessageSendEvent::SendFundingCreated,
@@ -556,7 +556,7 @@ macro_rules! open_channel {
 		);
 		get_event!($node_b, Event::ChannelPending);
 		$node_a.node.handle_funding_signed(
-			&$node_b.node.get_our_node_id(),
+			$node_b.node.get_our_node_id(),
 			&get_event_msg!(
 				$node_b,
 				MessageSendEvent::SendFundingSigned,
@@ -577,7 +577,7 @@ macro_rules! begin_open_channel {
 			.create_channel($node_b.node.get_our_node_id(), $channel_value, 100, 42, None, None)
 			.unwrap();
 		$node_b.node.handle_open_channel(
-			&$node_a.node.get_our_node_id(),
+			$node_a.node.get_our_node_id(),
 			&get_event_msg!(
 				$node_a,
 				MessageSendEvent::SendOpenChannel,
@@ -585,7 +585,7 @@ macro_rules! begin_open_channel {
 			),
 		);
 		$node_a.node.handle_accept_channel(
-			&$node_b.node.get_our_node_id(),
+			$node_b.node.get_our_node_id(),
 			&get_event_msg!(
 				$node_b,
 				MessageSendEvent::SendAcceptChannel,
@@ -611,11 +611,11 @@ macro_rules! handle_funding_generation_ready {
 				assert_eq!(user_channel_id, 42);
 
 				let tx = Transaction {
-					version: 1 as i32,
+					version: Version::ONE,
 					lock_time: LockTime::ZERO,
 					input: Vec::new(),
 					output: vec![TxOut {
-						value: channel_value_satoshis,
+						value: Amount::from_sat(channel_value_satoshis),
 						script_pubkey: output_script.clone(),
 					}],
 				};
@@ -649,11 +649,11 @@ fn confirm_transaction_depth(node: &mut Node, tx: &Transaction, depth: u32) {
 		node.best_block = BestBlock::new(header.block_hash(), height);
 		match i {
 			1 => {
-				node.channel_manager.transactions_confirmed(&header, &txdata, height);
+				node.node.transactions_confirmed(&header, &txdata, height);
 				node.chain_monitor.transactions_confirmed(&header, &txdata, height);
 			},
 			x if x == depth => {
-				node.channel_manager.best_block_updated(&header, height);
+				node.node.best_block_updated(&header, height);
 				node.chain_monitor.best_block_updated(&header, height);
 			},
 			_ => {},
@@ -672,12 +672,8 @@ fn advance_chain(node: &mut Node, num_blocks: u32) {
 		let header = create_dummy_header(prev_blockhash, height);
 		node.best_block = BestBlock::new(header.block_hash(), height);
 		if i == num_blocks {
-			node.channel_manager.best_block_updated(&header, height);
+			node.node.best_block_updated(&header, height);
 			node.chain_monitor.best_block_updated(&header, height);
 		}
 	}
-}
-
-pub(crate) fn get_ldk_events(node: &Node) -> Vec<Event> {
-	node.channel_manager.get_and_clear_pending_events()
 }

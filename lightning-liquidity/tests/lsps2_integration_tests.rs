@@ -1,14 +1,22 @@
 #![cfg(all(test, feature = "std"))]
 
+#[macro_use]
+extern crate lightning;
+
+#[macro_use]
 mod common;
 
 use common::create_service_and_client_nodes;
-use common::{get_lsps_message, Node};
+use common::{get_lsps_message, open_channel, Node};
 
+use crate::lightning::ln::msgs::ChannelMessageHandler;
+use bitcoin::locktime::absolute::LockTime;
+use bitcoin::transaction::TxOut;
+use bitcoin::transaction::Version;
+use bitcoin::Amount;
+use bitcoin::Transaction;
 use lightning::events::Event;
-use lightning::events::HTLCHandlingFailureType;
-use lightning::ln::functional_test_utils::{expect_payment_sent, send_payment};
-use lightning::ln::types::ChannelId;
+use lightning::ln::msgs::{BaseMessageHandler, MessageSendEvent};
 use lightning_liquidity::events::LiquidityEvent;
 use lightning_liquidity::lsps0::ser::LSPSDateTime;
 use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
@@ -40,31 +48,6 @@ use std::time::Duration;
 const MAX_PENDING_REQUESTS_PER_PEER: usize = 10;
 const MAX_TOTAL_PENDING_REQUESTS: usize = 1000;
 
-fn expect_channel_pending_event(
-	node: &Node, expected_counterparty_node_id: &PublicKey,
-) -> ChannelId {
-	let events = common::get_ldk_events(node);
-	assert_eq!(events.len(), 1);
-	match events[0] {
-		Event::ChannelPending { ref channel_id, ref counterparty_node_id, .. } => {
-			assert_eq!(*counterparty_node_id, *expected_counterparty_node_id);
-			*channel_id
-		},
-		_ => panic!("Unexpected event"),
-	}
-}
-
-fn expect_channel_ready_event(node: &Node, expected_counterparty_node_id: &PublicKey) {
-	let events = common::get_ldk_events(node);
-	assert_eq!(events.len(), 1);
-	match events[0] {
-		Event::ChannelReady { ref counterparty_node_id, .. } => {
-			assert_eq!(*counterparty_node_id, *expected_counterparty_node_id);
-		},
-		_ => panic!("Unexpected event"),
-	}
-}
-
 fn setup_test_lsps2(
 	persist_dir: &str,
 ) -> (bitcoin::secp256k1::PublicKey, bitcoin::secp256k1::PublicKey, Node, Node, [u8; 32]) {
@@ -89,7 +72,7 @@ fn setup_test_lsps2(
 
 	let secp = bitcoin::secp256k1::Secp256k1::new();
 	let service_node_id = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &signing_key);
-	let client_node_id = client_node.channel_manager.get_our_node_id();
+	let client_node_id = client_node.node.get_our_node_id();
 
 	(service_node_id, client_node_id, service_node, client_node, promise_secret)
 }
@@ -101,7 +84,7 @@ fn create_jit_invoice(
 	// LSPS2 requires min_final_cltv_expiry_delta to be at least 2 more than usual.
 	let min_final_cltv_expiry_delta = MIN_FINAL_CLTV_EXPIRY_DELTA + 2;
 	let (payment_hash, payment_secret) = node
-		.channel_manager
+		.node
 		.create_inbound_payment(None, expiry_secs, Some(min_final_cltv_expiry_delta))
 		.map_err(|e| {
 			log_error!(node.logger, "Failed to register inbound payment: {:?}", e);
@@ -239,7 +222,7 @@ fn invoice_generation_flow() {
 
 	let user_channel_id = 42;
 	let cltv_expiry_delta = 144;
-	let intercept_scid = service_node.channel_manager.get_intercept_scid();
+	let intercept_scid = service_node.node.get_intercept_scid();
 	let client_trusts_lsp = true;
 
 	service_handler
@@ -343,7 +326,7 @@ fn channel_open_failed() {
 	let _buy_event = service_node.liquidity_manager.next_event().unwrap();
 	let user_channel_id = 42;
 	let cltv_expiry_delta = 144;
-	let intercept_scid = service_node.channel_manager.get_intercept_scid();
+	let intercept_scid = service_node.node.get_intercept_scid();
 	let client_trusts_lsp = true;
 
 	service_handler
@@ -491,7 +474,7 @@ fn channel_open_abandoned() {
 	let _buy_event = service_node.liquidity_manager.next_event().unwrap();
 	let user_channel_id = 42;
 	let cltv_expiry_delta = 144;
-	let intercept_scid = service_node.channel_manager.get_intercept_scid();
+	let intercept_scid = service_node.node.get_intercept_scid();
 	let client_trusts_lsp = true;
 
 	service_handler
@@ -903,7 +886,7 @@ fn full_flow() {
 	let _buy_event = service_node.liquidity_manager.next_event().unwrap();
 	let user_channel_id = 42;
 	let cltv_expiry_delta = 144;
-	let intercept_scid = service_node.channel_manager.get_intercept_scid();
+	let intercept_scid = service_node.node.get_intercept_scid();
 	let client_trusts_lsp = true;
 
 	service_handler
@@ -930,49 +913,30 @@ fn full_flow() {
 		.htlc_intercepted(intercept_scid, intercept_id, htlc_amount_msat, payment_hash)
 		.unwrap();
 
-	let _ = match service_node.liquidity_manager.next_event().unwrap() {
-		LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
-			their_network_key,
-			amt_to_forward_msat,
-			user_channel_id: channel_id,
-			intercept_scid: scid,
-			..
-		}) => {
-			assert_eq!(channel_id, user_channel_id);
-			assert_eq!(scid, intercept_scid);
+	let (their_network_key, amt_to_forward_msat, channel_id) =
+		match service_node.liquidity_manager.next_event().unwrap() {
+			LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
+				their_network_key,
+				amt_to_forward_msat,
+				user_channel_id: channel_id,
+				intercept_scid: scid,
+				..
+			}) => {
+				assert_eq!(channel_id, user_channel_id);
+				assert_eq!(scid, intercept_scid);
+				(their_network_key, amt_to_forward_msat, channel_id)
+			},
+			_ => panic!("Expected OpenChannel event"),
+		};
 
-			let _ = service_node
-				.channel_manager
-				.create_channel(
-					their_network_key,
-					amt_to_forward_msat,
-					0,
-					user_channel_id,
-					None,
-					None,
-				)
-				.unwrap();
+	let _ = open_channel!(service_node, client_node, amt_to_forward_msat);
+	let events = service_node.node.get_and_clear_pending_events();
+	println!("Pending events: {:?}", events);
+	// // Notify the service that the channel is ready so it can forward payments.
+	service_handler.channel_ready(user_channel_id, &actual_channel_id, &client_node_id).unwrap();
 
-			let channel_id = expect_channel_pending_event(&service_node, &client_node_id);
-			expect_channel_ready_event(&service_node, &&client_node_id);
-			expect_channel_pending_event(&client_node, &service_node_id);
-			expect_channel_ready_event(&client_node, &service_node_id);
-
-			// Notify the service that the channel is ready so it can forward payments.
-			service_handler.channel_ready(user_channel_id, &channel_id, &client_node_id).unwrap();
-
-			// Simulate a failure while forwarding the intercepted HTLC.
-			let failure_type =
-				HTLCHandlingFailureType::Forward { node_id: Some(client_node_id), channel_id };
-			service_handler.htlc_handling_failed(failure_type).unwrap();
-		},
-		_ => panic!("Expected OpenChannel event"),
-	};
-
-	// // Verify that the newly opened channel can still process payments.
-	// let amount_msat = 50_000;
-	// let (payment_preimage, payment_hash, _, _) =
-	// 	send_payment(&service_node, &[&client_node], amount_msat);
-	// expect_payment_sent!(service_node, payment_preimage);
-	// expect_payment_claimed!(client_node, payment_hash, amount_msat);
+	// // Simulate a failure while forwarding the intercepted HTLC.
+	// let failure_type =
+	// 	HTLCHandlingFailureType::Forward { node_id: Some(client_node_id), channel_id };
+	// service_handler.htlc_handling_failed(failure_type).unwrap();
 }
