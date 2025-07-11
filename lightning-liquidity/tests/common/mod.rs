@@ -9,12 +9,15 @@ use lightning::sign::{EntropySource, NodeSigner};
 
 use bitcoin::blockdata::constants::{genesis_block, ChainHash};
 use bitcoin::blockdata::transaction::Transaction;
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bitcoin::Network;
 use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
 use lightning::chain::{chainmonitor, BestBlock, Confirm};
 use lightning::ln::channelmanager;
 use lightning::ln::channelmanager::ChainParameters;
-use lightning::ln::functional_test_utils::*;
+use lightning::ln::functional_test_utils::{
+	create_dummy_header, create_network, test_default_channel_config, Node as LdkNode,
+};
 use lightning::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, Init};
 use lightning::ln::peer_handler::{
 	IgnoringMessageHandler, MessageHandler, PeerManager, SocketDescriptor,
@@ -34,7 +37,10 @@ use lightning::util::persist::{
 	SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning::util::test_utils;
-use lightning_liquidity::{LiquidityClientConfig, LiquidityManager, LiquidityServiceConfig};
+use lightning_liquidity::{
+	lsps2::client::LSPS2ClientConfig, lsps2::service::LSPS2ServiceConfig, LiquidityClientConfig,
+	LiquidityManager, LiquidityServiceConfig,
+};
 use lightning_persister::fs_store::FilesystemStore;
 
 use std::collections::{HashMap, VecDeque};
@@ -111,6 +117,136 @@ type PGS = Arc<
 		Arc<test_utils::TestLogger>,
 	>,
 >;
+
+pub(crate) type TestCM<'a, 'b> = channelmanager::ChannelManager<
+	&'a test_utils::TestChainMonitor<'b>,
+	&'b test_utils::TestBroadcaster,
+	&'a test_utils::TestKeysInterface,
+	&'a test_utils::TestKeysInterface,
+	&'a test_utils::TestKeysInterface,
+	&'b test_utils::TestFeeEstimator,
+	&'a test_utils::TestRouter<'b>,
+	&'a test_utils::TestMessageRouter<'b>,
+	&'b test_utils::TestLogger,
+>;
+
+// Add this new LiquidityNode struct
+pub struct LiquidityNode<'a, 'b, 'c> {
+	pub inner: lightning::ln::functional_test_utils::Node<'a, 'b, 'c>,
+	pub liquidity_manager: LiquidityManager<
+		&'c test_utils::TestKeysInterface,
+		&'a TestCM<'b, 'c>,
+		Arc<dyn Filter + Send + Sync>,
+	>,
+}
+
+impl<'a, 'b, 'c> LiquidityNode<'a, 'b, 'c> {
+	pub fn new(
+		node: lightning::ln::functional_test_utils::Node<'a, 'b, 'c>,
+		liquidity_manager: LiquidityManager<
+			&'c test_utils::TestKeysInterface,
+			&'a TestCM<'b, 'c>,
+			Arc<dyn Filter + Send + Sync>,
+		>,
+	) -> Self {
+		Self { inner: node, liquidity_manager }
+	}
+}
+
+// Implement Deref to make it transparent
+impl<'a, 'b, 'c> std::ops::Deref for LiquidityNode<'a, 'b, 'c> {
+	type Target = lightning::ln::functional_test_utils::Node<'a, 'b, 'c>;
+	fn deref(&self) -> &Self::Target {
+		&self.inner
+	}
+}
+
+impl<'a, 'b, 'c> std::ops::DerefMut for LiquidityNode<'a, 'b, 'c> {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		&mut self.inner
+	}
+}
+
+// Update the setup function to return LiquidityNode instead of StaticLdkNode
+pub(crate) fn setup_test_lsps2_nodes() -> (
+	PublicKey,
+	PublicKey,
+	PublicKey,
+	LiquidityNode<'static, 'static, 'static>,
+	LiquidityNode<'static, 'static, 'static>,
+	lightning::ln::functional_test_utils::Node<'static, 'static, 'static>,
+	[u8; 32],
+) {
+	use lightning::chain::BestBlock;
+	use lightning::ln::channelmanager::ChainParameters;
+	use lightning::ln::functional_test_utils::{
+		create_chanmon_cfgs, create_node_cfgs, create_node_chanmgrs, Node as LdkNode,
+	};
+
+	let chanmon_cfgs = Box::leak(Box::new(create_chanmon_cfgs(3)));
+	let node_cfgs = Box::leak(Box::new(create_node_cfgs(3, chanmon_cfgs)));
+	let mut service_node_config = test_default_channel_config();
+	service_node_config.accept_intercept_htlcs = true;
+	let node_chanmgrs = Box::leak(Box::new(create_node_chanmgrs(
+		3,
+		node_cfgs,
+		&[Some(service_node_config), None, None],
+	)));
+	let nodes = create_network(3, node_cfgs, node_chanmgrs);
+
+	let promise_secret = [42; 32];
+	let service_config = LiquidityServiceConfig {
+		#[cfg(lsps1_service)]
+		lsps1_service_config: None,
+		lsps2_service_config: Some(LSPS2ServiceConfig { promise_secret }),
+		advertise_service: true,
+	};
+	let client_config = LiquidityClientConfig {
+		lsps1_client_config: None,
+		lsps2_client_config: Some(LSPS2ClientConfig::default()),
+	};
+	let chain_params = ChainParameters {
+		network: Network::Testnet,
+		best_block: BestBlock::from_network(Network::Testnet),
+	};
+
+	let service_lm = LiquidityManager::new(
+		nodes[0].keys_manager,
+		nodes[0].node,
+		None::<Arc<dyn Filter + Send + Sync>>,
+		Some(chain_params.clone()),
+		Some(service_config),
+		None,
+	);
+
+	let client_lm = LiquidityManager::new(
+		nodes[1].keys_manager,
+		nodes[1].node,
+		None::<Arc<dyn Filter + Send + Sync>>,
+		Some(chain_params),
+		None,
+		Some(client_config),
+	);
+
+	let service_node_id = nodes[0].node.get_our_node_id();
+	let client_node_id = nodes[1].node.get_our_node_id();
+	let payer_node_id = nodes[2].node.get_our_node_id();
+
+	let mut iter = nodes.into_iter();
+	let service_node = LiquidityNode::new(iter.next().unwrap(), service_lm);
+	let client_node = LiquidityNode::new(iter.next().unwrap(), client_lm);
+	let payer_node = iter.next().unwrap();
+
+	(
+		service_node_id,
+		client_node_id,
+		payer_node_id,
+		service_node,
+		client_node,
+		payer_node,
+		promise_secret,
+	)
+}
 
 pub(crate) struct Node {
 	pub(crate) channel_manager: Arc<ChannelManager>,
@@ -638,6 +774,18 @@ macro_rules! get_lsps_message {
 }
 
 pub(crate) use get_lsps_message;
+
+macro_rules! get_lsps_message_wip {
+	($node: expr, $expected_target_node_id: expr) => {{
+		let msgs = $node.liquidity_manager.as_ref().unwrap().get_and_clear_pending_msg();
+		assert_eq!(msgs.len(), 1);
+		let (target_node_id, message) = msgs.into_iter().next().unwrap();
+		assert_eq!(target_node_id, $expected_target_node_id);
+		message
+	}};
+}
+
+pub(crate) use get_lsps_message_wip;
 
 fn confirm_transaction_depth(node: &mut Node, tx: &Transaction, depth: u32) {
 	for i in 1..=depth {

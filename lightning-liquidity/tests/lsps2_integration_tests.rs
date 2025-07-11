@@ -2,9 +2,19 @@
 
 mod common;
 
+use crate::common::{setup_test_lsps2_nodes, LiquidityNode};
 use common::create_service_and_client_nodes;
 use common::{get_lsps_message, Node};
 
+use lightning::events::Event;
+use lightning::ln::msgs::ChannelMessageHandler;
+
+use lightning::sign::NodeSigner;
+
+use lightning::ln::functional_test_utils::{
+	create_announced_chan_between_nodes, create_chan_between_nodes_with_value,
+	expect_channel_ready_event, SendEvent,
+};
 use lightning_liquidity::events::LiquidityEvent;
 use lightning_liquidity::lsps0::ser::LSPSDateTime;
 use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
@@ -14,12 +24,14 @@ use lightning_liquidity::lsps2::msgs::LSPS2RawOpeningFeeParams;
 use lightning_liquidity::lsps2::service::LSPS2ServiceConfig;
 use lightning_liquidity::lsps2::utils::is_valid_opening_fee_params;
 
-use lightning::ln::channelmanager::{InterceptId, MIN_FINAL_CLTV_EXPIRY_DELTA};
+use lightning::ln::channelmanager::{InterceptId, PaymentId, Retry, MIN_FINAL_CLTV_EXPIRY_DELTA};
 use lightning::ln::peer_handler::CustomMessageHandler;
-use lightning::log_error;
 use lightning::routing::router::{RouteHint, RouteHintHop};
 use lightning::util::errors::APIError;
 use lightning::util::logger::Logger;
+use lightning::{
+	check_added_monitors, commitment_signed_dance, expect_pending_htlcs_forwardable, log_error,
+};
 
 use lightning_invoice::{Bolt11Invoice, InvoiceBuilder, RoutingFees};
 
@@ -66,13 +78,13 @@ fn setup_test_lsps2(
 }
 
 fn create_jit_invoice(
-	node: &Node, service_node_id: PublicKey, intercept_scid: u64, cltv_expiry_delta: u32,
-	payment_size_msat: Option<u64>, description: &str, expiry_secs: u32,
+	node: &LiquidityNode<'_, '_, '_>, service_node_id: PublicKey, intercept_scid: u64,
+	cltv_expiry_delta: u32, payment_size_msat: Option<u64>, description: &str, expiry_secs: u32,
 ) -> Result<Bolt11Invoice, ()> {
 	// LSPS2 requires min_final_cltv_expiry_delta to be at least 2 more than usual.
 	let min_final_cltv_expiry_delta = MIN_FINAL_CLTV_EXPIRY_DELTA + 2;
 	let (payment_hash, payment_secret) = node
-		.channel_manager
+		.node
 		.create_inbound_payment(None, expiry_secs, Some(min_final_cltv_expiry_delta))
 		.map_err(|e| {
 			log_error!(node.logger, "Failed to register inbound payment: {:?}", e);
@@ -107,20 +119,32 @@ fn create_jit_invoice(
 		invoice_builder = invoice_builder.amount_milli_satoshis(amount_msat).basic_mpp();
 	}
 
-	invoice_builder
-		.build_signed(|hash| {
-			Secp256k1::new().sign_ecdsa_recoverable(hash, &node.keys_manager.get_node_secret_key())
+	let raw_invoice = invoice_builder.build_raw().map_err(|e| {
+		log_error!(node.inner.logger, "Failed to build raw invoice: {:?}", e);
+		()
+	})?;
+
+	// Sign using the NodeSigner trait and then use build_signed with a closure
+	raw_invoice
+		.clone()
+		.sign(|_| {
+			// For the signing closure, we need to sign the hash directly
+			// We'll create a simple closure that signs with the node's keys
+			node.inner.keys_manager.sign_invoice(&raw_invoice, lightning::sign::Recipient::Node)
 		})
-		.map_err(|e| {
-			log_error!(node.logger, "Failed to build and sign invoice: {}", e);
-			()
+		.map_err(|_| ())
+		.and_then(|signed_raw| {
+			Bolt11Invoice::from_signed(signed_raw).map_err(|e| {
+				log_error!(node.inner.logger, "Failed to create invoice from signed raw: {:?}", e);
+				()
+			})
 		})
 }
 
 #[test]
 fn invoice_generation_flow() {
-	let (service_node_id, client_node_id, service_node, client_node, promise_secret) =
-		setup_test_lsps2("invoice_generation_flow");
+	let (service_node_id, client_node_id, _, service_node, client_node, _, promise_secret) =
+		setup_test_lsps2_nodes();
 
 	let client_handler = client_node.liquidity_manager.lsps2_client_handler().unwrap();
 	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
@@ -210,7 +234,7 @@ fn invoice_generation_flow() {
 
 	let user_channel_id = 42;
 	let cltv_expiry_delta = 144;
-	let intercept_scid = service_node.channel_manager.get_intercept_scid();
+	let intercept_scid = service_node.node.get_intercept_scid();
 	let client_trusts_lsp = true;
 
 	service_handler
@@ -816,5 +840,278 @@ fn opening_fee_params_menu_is_sorted_by_spec() {
 		}
 	} else {
 		panic!("Unexpected event");
+	}
+}
+
+#[test]
+fn happy_path() {
+	let (
+		service_node_id,
+		client_node_id,
+		payer_node_id,
+		mut service_node,
+		client_node,
+		payer_node,
+		promise_secret,
+	) = setup_test_lsps2_nodes();
+
+	let client_handler = client_node.liquidity_manager.lsps2_client_handler().unwrap();
+	let service_handler = service_node.liquidity_manager.lsps2_service_handler().unwrap();
+
+	let nodes = vec![payer_node, service_node.inner];
+	create_announced_chan_between_nodes(&nodes, 0, 1);
+	let [payer_node, service_node_inner] =
+		<[lightning::ln::functional_test_utils::Node; 2]>::try_from(nodes).ok().unwrap();
+	service_node.inner = service_node_inner;
+
+	let get_info_request_id = client_handler.request_opening_params(service_node_id, None);
+	let get_info_request = get_lsps_message!(client_node, service_node_id);
+
+	service_node.liquidity_manager.handle_custom_message(get_info_request, client_node_id).unwrap();
+
+	let get_info_event = service_node.liquidity_manager.next_event().unwrap();
+	if let LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::GetInfo {
+		request_id,
+		counterparty_node_id,
+		token,
+	}) = get_info_event
+	{
+		assert_eq!(request_id, get_info_request_id);
+		assert_eq!(counterparty_node_id, client_node_id);
+		assert_eq!(token, None);
+	} else {
+		panic!("Unexpected event");
+	}
+
+	let min_fee_msat = 100;
+	let raw_opening_params = LSPS2RawOpeningFeeParams {
+		min_fee_msat,
+		proportional: 21,
+		valid_until: LSPSDateTime::from_str("2035-05-20T08:30:45Z").unwrap(),
+		min_lifetime: 144,
+		max_client_to_self_delay: 128,
+		min_payment_size_msat: 1,
+		max_payment_size_msat: 100_000_000,
+	};
+
+	service_handler
+		.opening_fee_params_generated(
+			&client_node_id,
+			get_info_request_id.clone(),
+			vec![raw_opening_params],
+		)
+		.unwrap();
+	let get_info_response = get_lsps_message!(service_node, client_node_id);
+
+	client_node
+		.liquidity_manager
+		.handle_custom_message(get_info_response, service_node_id)
+		.unwrap();
+
+	let opening_params_event = client_node.liquidity_manager.next_event().unwrap();
+	let opening_fee_params = match opening_params_event {
+		LiquidityEvent::LSPS2Client(LSPS2ClientEvent::OpeningParametersReady {
+			request_id,
+			counterparty_node_id,
+			opening_fee_params_menu,
+		}) => {
+			assert_eq!(request_id, get_info_request_id);
+			assert_eq!(counterparty_node_id, service_node_id);
+			let opening_fee_params = opening_fee_params_menu.first().unwrap().clone();
+			assert!(is_valid_opening_fee_params(&opening_fee_params, &promise_secret));
+			opening_fee_params
+		},
+		_ => panic!("Unexpected event"),
+	};
+
+	let payment_size_msat = Some(1_000_000);
+	let buy_request_id = client_handler
+		.select_opening_params(service_node_id, payment_size_msat, opening_fee_params.clone())
+		.unwrap();
+
+	let buy_request = get_lsps_message!(client_node, service_node_id);
+	service_node.liquidity_manager.handle_custom_message(buy_request, client_node_id).unwrap();
+
+	let buy_event = service_node.liquidity_manager.next_event().unwrap();
+	if let LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::BuyRequest {
+		request_id,
+		counterparty_node_id,
+		opening_fee_params: ofp,
+		payment_size_msat: psm,
+	}) = buy_event
+	{
+		assert_eq!(request_id, buy_request_id);
+		assert_eq!(counterparty_node_id, client_node_id);
+		assert_eq!(opening_fee_params, ofp);
+		assert_eq!(payment_size_msat, psm);
+	} else {
+		panic!("Unexpected event");
+	}
+
+	let user_channel_id = 42;
+	let cltv_expiry_delta = 144;
+	let client_trusts_lsp = true;
+	let intercept_scid = service_node.inner.node.get_intercept_scid(); // Get from the updated node
+
+	service_handler
+		.invoice_parameters_generated(
+			&client_node_id,
+			buy_request_id.clone(),
+			intercept_scid,
+			cltv_expiry_delta,
+			client_trusts_lsp,
+			user_channel_id,
+		)
+		.unwrap();
+
+	let buy_response = get_lsps_message!(service_node, client_node_id);
+	client_node.liquidity_manager.handle_custom_message(buy_response, service_node_id).unwrap();
+
+	let invoice_params_event = client_node.liquidity_manager.next_event().unwrap();
+	if let LiquidityEvent::LSPS2Client(LSPS2ClientEvent::InvoiceParametersReady {
+		request_id,
+		counterparty_node_id,
+		intercept_scid: iscid,
+		cltv_expiry_delta: ced,
+		payment_size_msat: psm,
+	}) = invoice_params_event
+	{
+		assert_eq!(request_id, buy_request_id);
+		assert_eq!(counterparty_node_id, service_node_id);
+		assert_eq!(intercept_scid, iscid);
+		assert_eq!(cltv_expiry_delta, ced);
+		assert_eq!(payment_size_msat, psm);
+	} else {
+		panic!("Unexpected event");
+	}
+
+	let description = "asdf";
+	let expiry_secs = 3600;
+	let invoice = create_jit_invoice(
+		&client_node,
+		service_node_id,
+		intercept_scid,
+		cltv_expiry_delta,
+		payment_size_msat,
+		description,
+		expiry_secs,
+	)
+	.unwrap();
+
+	let _ = payer_node
+		.node
+		.pay_for_bolt11_invoice(
+			&invoice,
+			PaymentId(invoice.payment_hash().to_byte_array()),
+			None,
+			Default::default(),
+			Retry::Attempts(3),
+		)
+		.unwrap();
+
+	check_added_monitors!(payer_node, 1);
+	let payment_event = SendEvent::from_node(&payer_node);
+
+	service_node.inner.node.handle_update_add_htlc(payer_node_id, &payment_event.msgs[0]);
+	commitment_signed_dance!(service_node.inner, payer_node, payment_event.commitment_msg, false);
+
+	expect_pending_htlcs_forwardable!(service_node.inner);
+	println!("Service node should now have an HTLC intercepted event!!!!!!!!!!!!!!!!!!!!!!!1");
+	let events = service_node.inner.node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	let (payment_hash, intercept_id) = match &events[0] {
+		Event::HTLCIntercepted {
+			intercept_id,
+			requested_next_hop_scid,
+			payment_hash,
+			inbound_amount_msat: _,
+			expected_outbound_amount_msat,
+		} => {
+			assert_eq!(*requested_next_hop_scid, intercept_scid);
+
+			// Call the service handler's htlc_intercepted method
+			service_handler
+				.htlc_intercepted(
+					*requested_next_hop_scid,
+					*intercept_id,
+					*expected_outbound_amount_msat,
+					*payment_hash,
+				)
+				.unwrap();
+			(*payment_hash, intercept_id)
+		},
+		other => panic!("Expected HTLCIntercepted event, got: {:?}", other),
+	};
+
+	let open_channel_event = service_node.liquidity_manager.next_event().unwrap();
+	let amt_to_forward_msat = match open_channel_event {
+		LiquidityEvent::LSPS2Service(LSPS2ServiceEvent::OpenChannel {
+			their_network_key,
+			amt_to_forward_msat,
+			opening_fee_msat,
+			user_channel_id,
+			intercept_scid: iscd,
+		}) => {
+			assert_eq!(their_network_key, client_node_id);
+			// TODO
+			// assert_eq!(amt_to_forward_msat, payment_size_msat.unwrap());
+			assert_eq!(opening_fee_msat, min_fee_msat);
+			assert_eq!(user_channel_id, 42);
+			assert_eq!(iscd, intercept_scid);
+			amt_to_forward_msat
+		},
+		other => panic!("Expected OpenChannel event, got: {:?}", other),
+	};
+
+	let (_, _, _, channel_id, _) = create_chan_between_nodes_with_value(
+		&service_node.inner,
+		&client_node.inner,
+		amt_to_forward_msat,
+		0,
+	);
+
+	expect_channel_ready_event(&service_node.inner, &client_node_id);
+	expect_channel_ready_event(&client_node.inner, &service_node_id);
+
+	// Forward the intercepted HTLC to the newly created channel
+	service_node
+		.inner
+		.node
+		.forward_intercepted_htlc(*intercept_id, &channel_id, client_node_id, amt_to_forward_msat)
+		.unwrap();
+
+	// Handle pending HTLCs on client side
+	expect_pending_htlcs_forwardable!(client_node.inner);
+
+	// Check for payment claimable event on client
+	let client_events = client_node.inner.node.get_and_clear_pending_events();
+	assert_eq!(client_events.len(), 1);
+	let preimage = match &client_events[0] {
+		Event::PaymentClaimable { payment_hash: ph, amount_msat, purpose, .. } => {
+			assert_eq!(*ph, payment_hash);
+			println!("Client received payment claimable for {} msat", amount_msat);
+			purpose.preimage()
+		},
+		other => panic!("Expected PaymentClaimable event on client, got: {:?}", other),
+	};
+
+	// Claim the payment on client side
+	client_node.inner.node.claim_funds(preimage.unwrap());
+
+	// Handle pending HTLCs on service side
+	expect_pending_htlcs_forwardable!(service_node.inner);
+
+	// Check for payment forwarded event on service side and payment successful on payer
+	let service_events = service_node.inner.node.get_and_clear_pending_events();
+	println!("Service events: {:?}", service_events);
+
+	let payer_events = payer_node.node.get_and_clear_pending_events();
+	println!("Payer events: {:?}", payer_events);
+	assert_eq!(payer_events.len(), 1);
+	match &payer_events[0] {
+		Event::PaymentSent { payment_hash: ph, .. } => {
+			assert_eq!(*ph, payment_hash);
+		},
+		other => panic!("Expected PaymentSent event on payer, got: {:?}", other),
 	}
 }
