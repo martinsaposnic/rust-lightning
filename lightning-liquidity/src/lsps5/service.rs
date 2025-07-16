@@ -435,7 +435,7 @@ where
 
 	fn sign_notification(&self, body: &WebhookNotification, timestamp: &LSPSDateTime) -> String {
 		let message = format!(
-			"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {:?}",
+			"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {}",
 			timestamp.to_rfc3339(),
 			body
 		);

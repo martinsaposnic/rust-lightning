@@ -101,7 +101,7 @@ where
 		}
 
 		let message = format!(
-			"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {:?}",
+			"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {}",
 			signature_timestamp.to_rfc3339(),
 			notification
 		);
