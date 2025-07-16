@@ -461,7 +461,7 @@ pub enum WebhookNotificationMethod {
 }
 
 /// Webhook notification payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WebhookNotification {
 	/// Notification method with parameters.
 	pub method: WebhookNotificationMethod,
@@ -496,6 +496,17 @@ impl WebhookNotification {
 	/// Create an onion_message_incoming notification.
 	pub fn onion_message_incoming() -> Self {
 		Self::new(WebhookNotificationMethod::LSPS5OnionMessageIncoming)
+	}
+}
+
+impl fmt::Debug for WebhookNotification {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match serde_json::to_string(self) {
+			Ok(json) => f.write_str(&json),
+			// WebhookNotification is well defined and does not contain arbitrary data, so
+			// this case should never happen.
+			Err(_) => f.write_str("<failed-to-serialize>"),
+		}
 	}
 }
 
