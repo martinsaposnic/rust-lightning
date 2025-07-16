@@ -364,7 +364,7 @@ where
 	/// Notify that the client has one or more pending BOLT Onion Messages.
 	///
 	/// SHOULD be called by your LSP application logic when you receive Onion Messages
-	/// for `client_id` while the client is offline. Builds a [`WebhookNotificationMethod::LSPS5LiquidityManagementRequest`]
+	/// for `client_id` while the client is offline. Builds a [`WebhookNotificationMethod::LSPS5OnionMessageIncoming`]
 	/// notification, signs it, and enqueues HTTP POSTs to each registered webhook.
 	///
 	/// # Parameters
