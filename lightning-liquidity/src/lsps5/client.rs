@@ -15,7 +15,7 @@ use crate::lsps0::ser::{LSPSDateTime, LSPSMessage, LSPSProtocolMessageHandler, L
 use crate::lsps5::event::LSPS5ClientEvent;
 use crate::lsps5::msgs::{
 	LSPS5Message, LSPS5Request, LSPS5Response, ListWebhooksRequest, RemoveWebhookRequest,
-	SetWebhookRequest, WebhookNotification,
+	SetWebhookRequest,
 };
 
 use crate::message_queue::MessageQueue;
@@ -23,7 +23,7 @@ use crate::prelude::{new_hash_map, HashMap};
 use crate::sync::{Arc, Mutex, RwLock};
 use crate::utils::generate_request_id;
 
-use super::msgs::{LSPS5AppName, LSPS5ClientError, LSPS5Error, LSPS5WebhookUrl};
+use super::msgs::{LSPS5AppName, LSPS5Error, LSPS5WebhookUrl};
 use super::service::TimeProvider;
 
 use bitcoin::secp256k1::PublicKey;
@@ -31,9 +31,7 @@ use bitcoin::secp256k1::PublicKey;
 use lightning::ln::msgs::{ErrorAction, LightningError};
 use lightning::sign::EntropySource;
 use lightning::util::logger::Level;
-use lightning::util::message_signing;
 
-use alloc::collections::VecDeque;
 use alloc::string::String;
 
 use core::ops::Deref;
@@ -42,45 +40,16 @@ use core::time::Duration;
 /// Default maximum age in seconds for cached responses (1 hour).
 pub const DEFAULT_RESPONSE_MAX_AGE_SECS: u64 = 3600;
 
-/// Default retention time for signatures in minutes (LSPS5 spec requires min 20 minutes).
-pub const DEFAULT_SIGNATURE_RETENTION_MINUTES: u64 = 20;
-
-/// Default maximum number of stored signatures.
-pub const DEFAULT_MAX_SIGNATURES: usize = 1000;
-
-/// Configuration for signature storage.
-#[derive(Clone, Copy, Debug)]
-pub struct SignatureStorageConfig {
-	/// Maximum number of signatures to store.
-	pub max_signatures: usize,
-	/// Retention time for signatures in minutes.
-	pub retention_minutes: Duration,
-}
-
-impl Default for SignatureStorageConfig {
-	fn default() -> Self {
-		Self {
-			max_signatures: DEFAULT_MAX_SIGNATURES,
-			retention_minutes: Duration::from_secs(DEFAULT_SIGNATURE_RETENTION_MINUTES * 60),
-		}
-	}
-}
-
 #[derive(Debug, Clone)]
 /// Configuration for the LSPS5 client
 pub struct LSPS5ClientConfig {
 	/// Maximum age in seconds for cached responses (default: 3600 - 1 hour).
 	pub response_max_age_secs: Duration,
-	/// Configuration for signature storage.
-	pub signature_config: SignatureStorageConfig,
 }
 
 impl Default for LSPS5ClientConfig {
 	fn default() -> Self {
-		Self {
-			response_max_age_secs: Duration::from_secs(DEFAULT_RESPONSE_MAX_AGE_SECS),
-			signature_config: SignatureStorageConfig::default(),
-		}
+		Self { response_max_age_secs: Duration::from_secs(DEFAULT_RESPONSE_MAX_AGE_SECS) }
 	}
 }
 
@@ -141,20 +110,24 @@ where
 /// Client-side handler for the LSPS5 (bLIP-55) webhook registration protocol.
 ///
 /// `LSPS5ClientHandler` is the primary interface for LSP clients
-/// to register, list, and remove webhook endpoints with an LSP, and to parse
-/// and validate incoming signed notifications.
+/// to register, list, and remove webhook endpoints with an LSP.
+///
+/// This handler is intended for use on the client-side (e.g., a mobile app)
+/// which has access to the node's keys and can send/receive peer messages.
+///
+/// For validating incoming webhook notifications on a server, see [`LSPS5Validator`].
 ///
 /// # Core Capabilities
 ///
 ///  - `set_webhook(peer, app_name, url)` -> register or update a webhook [`lsps5.set_webhook`]
 ///  - `list_webhooks(peer)` -> retrieve all registered webhooks [`lsps5.list_webhooks`]
 ///  - `remove_webhook(peer, name)` -> delete a webhook [`lsps5.remove_webhook`]
-///  - `parse_webhook_notification(...)` -> verify signature, timestamp, replay, and emit event
 ///
 /// [`bLIP-55 / LSPS5 specification`]: https://github.com/lightning/blips/pull/55/files
 /// [`lsps5.set_webhook`]: super::msgs::LSPS5Request::SetWebhook
 /// [`lsps5.list_webhooks`]: super::msgs::LSPS5Request::ListWebhooks
 /// [`lsps5.remove_webhook`]: super::msgs::LSPS5Request::RemoveWebhook
+/// [`LSPS5Validator`]: super::validator::LSPS5Validator
 pub struct LSPS5ClientHandler<ES: Deref, TP: Deref + Clone>
 where
 	ES::Target: EntropySource,
@@ -166,7 +139,6 @@ where
 	per_peer_state: RwLock<HashMap<PublicKey, Mutex<PeerState<TP>>>>,
 	config: LSPS5ClientConfig,
 	time_provider: TP,
-	recent_signatures: Mutex<VecDeque<(String, LSPSDateTime)>>,
 }
 
 impl<ES: Deref, TP: Deref + Clone> LSPS5ClientHandler<ES, TP>
@@ -179,7 +151,6 @@ where
 		entropy_source: ES, pending_messages: Arc<MessageQueue>, pending_events: Arc<EventQueue>,
 		config: LSPS5ClientConfig, time_provider: TP,
 	) -> Self {
-		let max_signatures = config.signature_config.max_signatures;
 		Self {
 			pending_messages,
 			pending_events,
@@ -187,7 +158,6 @@ where
 			per_peer_state: RwLock::new(new_hash_map()),
 			config,
 			time_provider,
-			recent_signatures: Mutex::new(VecDeque::with_capacity(max_signatures)),
 		}
 	}
 
@@ -445,93 +415,6 @@ where
 		};
 		self.with_peer_state(*counterparty_node_id, handle_response);
 		result
-	}
-
-	fn verify_notification_signature(
-		&self, counterparty_node_id: PublicKey, signature_timestamp: &LSPSDateTime,
-		signature: &str, notification: &WebhookNotification,
-	) -> Result<(), LSPS5ClientError> {
-		let now =
-			LSPSDateTime::new_from_duration_since_epoch(self.time_provider.duration_since_epoch());
-		let diff = signature_timestamp.abs_diff(&now);
-		const MAX_TIMESTAMP_DRIFT_SECS: u64 = 600;
-		if diff > MAX_TIMESTAMP_DRIFT_SECS {
-			return Err(LSPS5ClientError::InvalidTimestamp);
-		}
-
-		let message = format!(
-			"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {:?}",
-			signature_timestamp.to_rfc3339(),
-			notification
-		);
-
-		if message_signing::verify(message.as_bytes(), signature, &counterparty_node_id) {
-			Ok(())
-		} else {
-			Err(LSPS5ClientError::InvalidSignature)
-		}
-	}
-
-	fn check_signature_exists(&self, signature: &str) -> Result<(), LSPS5ClientError> {
-		let recent_signatures = self.recent_signatures.lock().unwrap();
-
-		for (stored_sig, _) in recent_signatures.iter() {
-			if stored_sig == signature {
-				return Err(LSPS5ClientError::ReplayAttack);
-			}
-		}
-
-		Ok(())
-	}
-
-	fn store_signature(&self, signature: String) {
-		let now =
-			LSPSDateTime::new_from_duration_since_epoch(self.time_provider.duration_since_epoch());
-		let mut recent_signatures = self.recent_signatures.lock().unwrap();
-
-		recent_signatures.push_back((signature, now.clone()));
-
-		let retention_secs = self.config.signature_config.retention_minutes.as_secs();
-		recent_signatures.retain(|(_, ts)| now.abs_diff(&ts) <= retention_secs);
-		if recent_signatures.len() > self.config.signature_config.max_signatures {
-			recent_signatures.truncate(self.config.signature_config.max_signatures);
-		}
-	}
-
-	/// Parse and validate a webhook notification received from an LSP.
-	///
-	/// Verifies the webhook delivery by parsing the notification JSON-RPC 2.0 format,
-	/// checking the timestamp is within ±10 minutes, ensuring no signature replay within the retention window,
-	/// and verifying the zbase32 LN-style signature against the LSP's node ID.
-	///
-	/// # Parameters
-	/// - `counterparty_node_id`: the LSP's public key, used to verify the signature.
-	/// - `timestamp`: ISO8601 time when the LSP created the notification.
-	/// - `signature`: the zbase32-encoded LN signature over timestamp+body.
-	/// - `notification`: the [`WebhookNotification`] received from the LSP.
-	///
-	/// Returns the validated [`WebhookNotification`] or an error for invalid timestamp,
-	/// replay attack, or signature verification failure.
-	///
-	/// Call this method before processing any webhook notification to ensure authenticity.
-	///
-	/// [`WebhookNotification`]: super::msgs::WebhookNotification
-	pub fn parse_webhook_notification(
-		&self, counterparty_node_id: PublicKey, timestamp: &LSPSDateTime, signature: &str,
-		notification: &WebhookNotification,
-	) -> Result<WebhookNotification, LSPS5ClientError> {
-		self.verify_notification_signature(
-			counterparty_node_id,
-			timestamp,
-			signature,
-			&notification,
-		)?;
-
-		self.check_signature_exists(signature)?;
-
-		self.store_signature(signature.to_string());
-
-		Ok(notification.clone())
 	}
 }
 

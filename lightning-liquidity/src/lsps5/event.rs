@@ -36,9 +36,9 @@ pub enum LSPS5ServiceEvent {
 	///
 	/// The notification is signed using the LSP's node ID to ensure authenticity
 	/// when received by the client. The client verifies this signature using
-	/// [`parse_webhook_notification`], which guards against replay attacks and tampering.
+	/// [`validate`], which guards against replay attacks and tampering.
 	///
-	/// [`parse_webhook_notification`]: super::client::LSPS5ClientHandler::parse_webhook_notification
+	/// [`validate`]: super::validator::LSPS5Validator::validate
 	/// [`notification_cooldown_hours`]: super::service::LSPS5ServiceConfig::notification_cooldown_hours
 	/// [`url`]: super::msgs::LSPS5WebhookUrl
 	/// [`notification`]: super::msgs::WebhookNotification

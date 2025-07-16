@@ -9,7 +9,7 @@ use lightning::ln::peer_handler::CustomMessageHandler;
 use lightning::util::hash_tables::{HashMap, HashSet};
 use lightning_liquidity::events::LiquidityEvent;
 use lightning_liquidity::lsps0::ser::LSPSDateTime;
-use lightning_liquidity::lsps5::client::{LSPS5ClientConfig, SignatureStorageConfig};
+use lightning_liquidity::lsps5::client::LSPS5ClientConfig;
 use lightning_liquidity::lsps5::event::{LSPS5ClientEvent, LSPS5ServiceEvent};
 use lightning_liquidity::lsps5::msgs::{
 	LSPS5AppName, LSPS5ClientError, LSPS5ProtocolError, LSPS5WebhookUrl, WebhookNotification,
@@ -18,6 +18,9 @@ use lightning_liquidity::lsps5::msgs::{
 use lightning_liquidity::lsps5::service::{DefaultTimeProvider, LSPS5ServiceConfig, TimeProvider};
 use lightning_liquidity::lsps5::service::{
 	MIN_WEBHOOK_RETENTION_DAYS, PRUNE_STALE_WEBHOOKS_INTERVAL_DAYS,
+};
+use lightning_liquidity::lsps5::validator::{
+	InMemorySignatureStore, LSPS5Validator, SignatureStorageConfig,
 };
 use lightning_liquidity::{LiquidityClientConfig, LiquidityServiceConfig};
 use std::sync::{Arc, RwLock};
@@ -28,9 +31,14 @@ pub(crate) const DEFAULT_MAX_WEBHOOKS_PER_CLIENT: u32 = 10;
 /// Default notification cooldown time in hours.
 pub(crate) const DEFAULT_NOTIFICATION_COOLDOWN_HOURS: Duration = Duration::from_secs(24 * 60 * 60);
 
+type TestValidator = LSPS5Validator<
+	Arc<dyn TimeProvider + Send + Sync>,
+	Arc<InMemorySignatureStore<Arc<dyn TimeProvider + Send + Sync>>>,
+>;
+
 pub(crate) fn lsps5_test_setup(
 	time_provider: Arc<dyn TimeProvider + Send + Sync>, max_signatures: Option<usize>,
-) -> (bitcoin::secp256k1::PublicKey, bitcoin::secp256k1::PublicKey, Node, Node) {
+) -> (bitcoin::secp256k1::PublicKey, bitcoin::secp256k1::PublicKey, Node, Node, TestValidator) {
 	let signing_key = SecretKey::from_slice(&[42; 32]).unwrap();
 	let mut lsps5_service_config = LSPS5ServiceConfig {
 		max_webhooks_per_client: DEFAULT_MAX_WEBHOOKS_PER_CLIENT,
@@ -46,12 +54,7 @@ pub(crate) fn lsps5_test_setup(
 		advertise_service: true,
 	};
 
-	let mut signature_config = SignatureStorageConfig::default();
-	if let Some(max_signatures) = max_signatures {
-		signature_config.max_signatures = max_signatures;
-	}
-	let mut lsps5_client_config = LSPS5ClientConfig::default();
-	lsps5_client_config.signature_config = signature_config;
+	let lsps5_client_config = LSPS5ClientConfig::default();
 
 	let client_config = LiquidityClientConfig {
 		lsps1_client_config: None,
@@ -63,14 +66,23 @@ pub(crate) fn lsps5_test_setup(
 		"webhook_registration_flow",
 		service_config,
 		client_config,
-		time_provider,
+		time_provider.clone(),
 	);
 
 	let secp = bitcoin::secp256k1::Secp256k1::new();
 	let service_node_id = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &signing_key);
 	let client_node_id = client_node.channel_manager.get_our_node_id();
 
-	(service_node_id, client_node_id, service_node, client_node)
+	let mut signature_config = SignatureStorageConfig::default();
+	if let Some(max_signatures) = max_signatures {
+		signature_config.max_signatures = max_signatures;
+	}
+
+	let signature_store =
+		Arc::new(InMemorySignatureStore::new(signature_config, time_provider.clone()));
+	let validator = LSPS5Validator::new(time_provider, signature_store);
+
+	(service_node_id, client_node_id, service_node, client_node, validator)
 }
 
 struct MockTimeProvider {
@@ -113,7 +125,7 @@ fn extract_ts_sig(headers: &HashMap<String, String>) -> (LSPSDateTime, String) {
 
 #[test]
 fn webhook_registration_flow() {
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, _) =
 		lsps5_test_setup(Arc::new(DefaultTimeProvider), None);
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
 
@@ -297,7 +309,7 @@ fn webhook_registration_flow() {
 
 #[test]
 fn webhook_error_handling_test() {
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, _) =
 		lsps5_test_setup(Arc::new(DefaultTimeProvider), None);
 
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
@@ -415,7 +427,7 @@ fn webhook_error_handling_test() {
 
 #[test]
 fn webhook_notification_delivery_test() {
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, validator) =
 		lsps5_test_setup(Arc::new(DefaultTimeProvider), None);
 
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
@@ -458,12 +470,8 @@ fn webhook_notification_delivery_test() {
 
 	let _ = client_node.liquidity_manager.next_event().unwrap();
 
-	let result = client_handler.parse_webhook_notification(
-		service_node_id,
-		&timestamp_value,
-		&signature_value,
-		&notification,
-	);
+	let result =
+		validator.validate(service_node_id, &timestamp_value, &signature_value, &notification);
 	assert!(
 		result.is_ok(),
 		"Client should be able to parse and validate the webhook_registered notification"
@@ -487,12 +495,8 @@ fn webhook_notification_delivery_test() {
 		_ => panic!("Expected SendWebhookNotification event for payment_incoming"),
 	};
 
-	let result = client_handler.parse_webhook_notification(
-		service_node_id,
-		&payment_timestamp,
-		&payment_signature,
-		&notification,
-	);
+	let result =
+		validator.validate(service_node_id, &payment_timestamp, &payment_signature, &notification);
 	assert!(
 		result.is_ok(),
 		"Client should be able to parse and validate the payment_incoming notification"
@@ -525,7 +529,7 @@ fn webhook_notification_delivery_test() {
 
 #[test]
 fn multiple_webhooks_notification_test() {
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, _) =
 		lsps5_test_setup(Arc::new(DefaultTimeProvider), None);
 
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
@@ -619,7 +623,7 @@ fn multiple_webhooks_notification_test() {
 
 #[test]
 fn idempotency_set_webhook_test() {
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, _) =
 		lsps5_test_setup(Arc::new(DefaultTimeProvider), None);
 
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
@@ -713,7 +717,7 @@ fn idempotency_set_webhook_test() {
 
 #[test]
 fn replay_prevention_test() {
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, validator) =
 		lsps5_test_setup(Arc::new(DefaultTimeProvider), None);
 
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
@@ -751,13 +755,11 @@ fn replay_prevention_test() {
 		_ => panic!("Expected SendWebhookNotification event"),
 	};
 
-	let result =
-		client_handler.parse_webhook_notification(service_node_id, &timestamp, &signature, &body);
+	let result = validator.validate(service_node_id, &timestamp, &signature, &body);
 	assert!(result.is_ok(), "First verification should succeed");
 
 	// Try again with same timestamp and signature (simulate replay attack)
-	let replay_result =
-		client_handler.parse_webhook_notification(service_node_id, &timestamp, &signature, &body);
+	let replay_result = validator.validate(service_node_id, &timestamp, &signature, &body);
 
 	// This should now fail since we've implemented replay prevention
 	assert!(replay_result.is_err(), "Replay attack should be detected and rejected");
@@ -770,7 +772,7 @@ fn replay_prevention_test() {
 fn stale_webhooks() {
 	let mock_time_provider = Arc::new(MockTimeProvider::new(1000));
 	let time_provider = Arc::<MockTimeProvider>::clone(&mock_time_provider);
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, _) =
 		lsps5_test_setup(time_provider, None);
 
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
@@ -829,7 +831,7 @@ fn stale_webhooks() {
 
 #[test]
 fn test_all_notifications() {
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, validator) =
 		lsps5_test_setup(Arc::new(DefaultTimeProvider), None);
 
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
@@ -871,12 +873,8 @@ fn test_all_notifications() {
 			assert_eq!(notification.method, expected_method);
 			let (timestamp, signature) = extract_ts_sig(&headers);
 
-			let parse_result = client_handler.parse_webhook_notification(
-				service_node_id,
-				&timestamp,
-				&signature,
-				&notification,
-			);
+			let parse_result =
+				validator.validate(service_node_id, &timestamp, &signature, &notification);
 			assert!(parse_result.is_ok(), "Failed to parse {:?} notification", expected_method);
 		} else {
 			panic!("Unexpected event: {:?}", event);
@@ -886,7 +884,7 @@ fn test_all_notifications() {
 
 #[test]
 fn test_tampered_notification() {
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, validator) =
 		lsps5_test_setup(Arc::new(DefaultTimeProvider), None);
 
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
@@ -921,12 +919,8 @@ fn test_tampered_notification() {
 		let tampered_notification: WebhookNotification =
 			serde_json::from_str(&tampered_timeout_json).unwrap();
 		let (timestamp, signature) = extract_ts_sig(&headers);
-		let tampered_result = client_handler.parse_webhook_notification(
-			service_node_id,
-			&timestamp,
-			&signature,
-			&tampered_notification,
-		);
+		let tampered_result =
+			validator.validate(service_node_id, &timestamp, &signature, &tampered_notification);
 		assert_eq!(tampered_result.unwrap_err(), LSPS5ClientError::InvalidSignature);
 	} else {
 		panic!("Unexpected event: {:?}", event);
@@ -937,7 +931,7 @@ fn test_tampered_notification() {
 
 #[test]
 fn test_bad_signature_notification() {
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, validator) =
 		lsps5_test_setup(Arc::new(DefaultTimeProvider), None);
 
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
@@ -967,12 +961,8 @@ fn test_bad_signature_notification() {
 		let (timestamp, _) = extract_ts_sig(&headers);
 
 		let invalid_signature = "xdtk1zf63sfn81r6qteymy73mb1b7dspj5kwx46uxwd6c3pu7y3bto";
-		let bad_signature_result = client_handler.parse_webhook_notification(
-			service_node_id,
-			&timestamp,
-			&invalid_signature,
-			&notification,
-		);
+		let bad_signature_result =
+			validator.validate(service_node_id, &timestamp, &invalid_signature, &notification);
 		assert!(bad_signature_result.unwrap_err() == LSPS5ClientError::InvalidSignature);
 	} else {
 		panic!("Unexpected event: {:?}", event);
@@ -990,7 +980,7 @@ fn test_timestamp_notification_window_validation() {
 			.as_secs(),
 	));
 	let time_provider = Arc::<MockTimeProvider>::clone(&mock_time_provider);
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, validator) =
 		lsps5_test_setup(time_provider, None);
 
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
@@ -1025,9 +1015,8 @@ fn test_timestamp_notification_window_validation() {
 
 		// 1) future timestamp
 		mock_time_provider.advance_time(60 * 60);
-		let err_past = client_handler
-			.parse_webhook_notification(service_node_id, &timestamp, &signature, &notification)
-			.unwrap_err();
+		let err_past =
+			validator.validate(service_node_id, &timestamp, &signature, &notification).unwrap_err();
 		assert!(
 			matches!(err_past, LSPS5ClientError::InvalidTimestamp),
 			"Expected InvalidTimestamp error variant, got {:?}",
@@ -1036,9 +1025,8 @@ fn test_timestamp_notification_window_validation() {
 
 		// 2) Past timestamp
 		mock_time_provider.rewind_time(60 * 60 * 2);
-		let err_future = client_handler
-			.parse_webhook_notification(service_node_id, &timestamp, &signature, &notification)
-			.unwrap_err();
+		let err_future =
+			validator.validate(service_node_id, &timestamp, &signature, &notification).unwrap_err();
 		assert!(
 			matches!(err_future, LSPS5ClientError::InvalidTimestamp),
 			"Expected InvalidTimestamp error variant, got {:?}",
@@ -1053,7 +1041,7 @@ fn test_timestamp_notification_window_validation() {
 
 #[test]
 fn test_notify_without_webhooks_does_nothing() {
-	let (_, client_node_id, service_node, _) =
+	let (_, client_node_id, service_node, _, _) =
 		lsps5_test_setup(Arc::new(DefaultTimeProvider), None);
 
 	let service_handler = service_node.liquidity_manager.lsps5_service_handler().unwrap();
@@ -1068,7 +1056,7 @@ fn test_notify_without_webhooks_does_nothing() {
 
 #[test]
 fn no_replay_error_when_signature_storage_is_disabled() {
-	let (service_node_id, client_node_id, service_node, client_node) =
+	let (service_node_id, client_node_id, service_node, client_node, validator) =
 		lsps5_test_setup(Arc::new(DefaultTimeProvider), Some(0));
 
 	let client_handler = client_node.liquidity_manager.lsps5_client_handler().unwrap();
@@ -1109,12 +1097,7 @@ fn no_replay_error_when_signature_storage_is_disabled() {
 	// max_signatures is set to 0, so there is no replay attack prevention
 	// and the same notification can be parsed multiple times without error
 	for _ in 0..4 {
-		let result = client_handler.parse_webhook_notification(
-			service_node_id,
-			&timestamp,
-			&signature,
-			&body,
-		);
+		let result = validator.validate(service_node_id, &timestamp, &signature, &body);
 		assert!(result.is_ok(), "Verification should succeed because storage is disabled");
 	}
 }

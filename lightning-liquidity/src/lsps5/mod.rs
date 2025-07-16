@@ -20,3 +20,4 @@ pub mod event;
 pub mod msgs;
 pub mod service;
 pub mod url_utils;
+pub mod validator;
