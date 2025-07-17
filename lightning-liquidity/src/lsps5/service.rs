@@ -406,15 +406,15 @@ where
 
 		let now =
 			LSPSDateTime::new_from_duration_since_epoch(self.time_provider.duration_since_epoch());
-		let cooldown_duration = self.config.notification_cooldown_hours * 3600;
 
 		for (app_name, webhook) in client_webhooks.iter_mut() {
 			if webhook
 				.last_notification_sent
 				.get(&notification.method)
 				.map(|last_sent| now.clone().abs_diff(&last_sent))
-				.map_or(true, |duration| duration >= cooldown_duration.as_secs())
-			{
+				.map_or(true, |duration| {
+					duration >= self.config.notification_cooldown_hours.as_secs()
+				}) {
 				webhook.last_notification_sent.insert(notification.method.clone(), now.clone());
 				webhook.last_used = now.clone();
 				self.send_notification(
