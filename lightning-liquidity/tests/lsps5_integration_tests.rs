@@ -477,7 +477,7 @@ fn webhook_notification_delivery_test() {
 		"Client should be able to parse and validate the webhook_registered notification"
 	);
 
-	service_handler.notify_payment_incoming(client_node_id);
+	let _ = service_handler.notify_payment_incoming(client_node_id);
 
 	let payment_notification_event = service_node.liquidity_manager.next_event().unwrap();
 	let (payment_timestamp, payment_signature, notification) = match payment_notification_event {
@@ -502,7 +502,7 @@ fn webhook_notification_delivery_test() {
 		"Client should be able to parse and validate the payment_incoming notification"
 	);
 
-	service_handler.notify_payment_incoming(client_node_id);
+	let _ = service_handler.notify_payment_incoming(client_node_id);
 
 	assert!(
 		service_node.liquidity_manager.next_event().is_none(),
@@ -510,7 +510,7 @@ fn webhook_notification_delivery_test() {
 	);
 
 	let timeout_block = 700000; // Some future block height
-	service_handler.notify_expiry_soon(client_node_id, timeout_block);
+	let _ = service_handler.notify_expiry_soon(client_node_id, timeout_block);
 
 	let expiry_notification_event = service_node.liquidity_manager.next_event().unwrap();
 	match expiry_notification_event {
@@ -564,7 +564,7 @@ fn multiple_webhooks_notification_test() {
 		let _ = client_node.liquidity_manager.next_event().unwrap();
 	}
 
-	service_handler.notify_liquidity_management_request(client_node_id);
+	let _ = service_handler.notify_liquidity_management_request(client_node_id);
 
 	let mut seen_webhooks = HashSet::default();
 
@@ -740,7 +740,7 @@ fn replay_prevention_test() {
 
 	let _ = client_node.liquidity_manager.next_event().unwrap();
 
-	service_handler.notify_payment_incoming(client_node_id);
+	let _ = service_handler.notify_payment_incoming(client_node_id);
 
 	let notification_event = service_node.liquidity_manager.next_event().unwrap();
 	let (timestamp, signature, body) = match notification_event {
@@ -848,10 +848,10 @@ fn test_all_notifications() {
 	// consume initial SendWebhookNotification
 	let _ = service_node.liquidity_manager.next_event().unwrap();
 
-	service_handler.notify_onion_message_incoming(client_node_id);
-	service_handler.notify_payment_incoming(client_node_id);
-	service_handler.notify_expiry_soon(client_node_id, 1000);
-	service_handler.notify_liquidity_management_request(client_node_id);
+	let _ = service_handler.notify_onion_message_incoming(client_node_id);
+	let _ = service_handler.notify_payment_incoming(client_node_id);
+	let _ = service_handler.notify_expiry_soon(client_node_id, 1000);
+	let _ = service_handler.notify_liquidity_management_request(client_node_id);
 
 	let expected_notifications = vec![
 		WebhookNotificationMethod::LSPS5OnionMessageIncoming,
@@ -901,7 +901,7 @@ fn test_tampered_notification() {
 	// consume initial SendWebhookNotification
 	let _ = service_node.liquidity_manager.next_event().unwrap();
 
-	service_handler.notify_expiry_soon(client_node_id, 700000);
+	let _ = service_handler.notify_expiry_soon(client_node_id, 700000);
 
 	let event = service_node.liquidity_manager.next_event().unwrap();
 	if let LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::SendWebhookNotification {
@@ -948,7 +948,7 @@ fn test_bad_signature_notification() {
 	// consume initial SendWebhookNotification
 	let _ = service_node.liquidity_manager.next_event().unwrap();
 
-	service_handler.notify_onion_message_incoming(client_node_id);
+	let _ = service_handler.notify_onion_message_incoming(client_node_id);
 
 	let event = service_node.liquidity_manager.next_event().unwrap();
 	if let LiquidityEvent::LSPS5Service(LSPS5ServiceEvent::SendWebhookNotification {
@@ -997,7 +997,7 @@ fn test_timestamp_notification_window_validation() {
 	// consume initial SendWebhookNotification
 	let _ = service_node.liquidity_manager.next_event().unwrap();
 
-	service_handler.notify_onion_message_incoming(client_node_id);
+	let _ = service_handler.notify_onion_message_incoming(client_node_id);
 
 	let expected_method = WebhookNotificationMethod::LSPS5OnionMessageIncoming;
 
@@ -1047,10 +1047,10 @@ fn test_notify_without_webhooks_does_nothing() {
 	let service_handler = service_node.liquidity_manager.lsps5_service_handler().unwrap();
 
 	// without ever registering a webhook -> both notifiers should early-return
-	service_handler.notify_payment_incoming(client_node_id);
+	let _ = service_handler.notify_payment_incoming(client_node_id);
 	assert!(service_node.liquidity_manager.next_event().is_none());
 
-	service_handler.notify_onion_message_incoming(client_node_id);
+	let _ = service_handler.notify_onion_message_incoming(client_node_id);
 	assert!(service_node.liquidity_manager.next_event().is_none());
 }
 
@@ -1079,7 +1079,7 @@ fn no_replay_error_when_signature_storage_is_disabled() {
 
 	let _ = client_node.liquidity_manager.next_event().unwrap();
 
-	service_handler.notify_payment_incoming(client_node_id);
+	let _ = service_handler.notify_payment_incoming(client_node_id);
 
 	let notification_event = service_node.liquidity_manager.next_event().unwrap();
 	let (timestamp, signature, body) = match notification_event {

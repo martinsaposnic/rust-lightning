@@ -233,7 +233,19 @@ where
 				counterparty_node_id,
 				params.app_name,
 				params.webhook,
-			);
+			)
+			.map_err(|e| {
+				let msg = LSPS5Message::Response(
+					request_id.clone(),
+					LSPS5Response::SetWebhookError(e.clone().into()),
+				)
+				.into();
+				self.pending_messages.enqueue(&counterparty_node_id, msg);
+				LightningError {
+					err: e.message().into(),
+					action: ErrorAction::IgnoreAndLog(Level::Info),
+				}
+			})?;
 		}
 
 		let msg = LSPS5Message::Response(
@@ -307,7 +319,7 @@ where
 
 	fn send_webhook_registered_notification(
 		&self, client_node_id: PublicKey, app_name: LSPS5AppName, url: LSPS5WebhookUrl,
-	) {
+	) -> Result<(), LSPS5ProtocolError> {
 		let notification = WebhookNotification::webhook_registered();
 		self.send_notification(client_node_id, app_name, url, notification)
 	}
@@ -323,7 +335,7 @@ where
 	/// - `client_id`: the client's node-ID whose webhooks should be invoked.
 	///
 	/// [`WebhookNotificationMethod::LSPS5PaymentIncoming`]: super::msgs::WebhookNotificationMethod::LSPS5PaymentIncoming
-	pub fn notify_payment_incoming(&self, client_id: PublicKey) {
+	pub fn notify_payment_incoming(&self, client_id: PublicKey) -> Result<(), LSPS5ProtocolError> {
 		let notification = WebhookNotification::payment_incoming();
 		self.broadcast_notification(client_id, notification)
 	}
@@ -341,7 +353,9 @@ where
 	/// - `timeout`: the block height at which the channel contract will expire.
 	///
 	/// [`WebhookNotificationMethod::LSPS5ExpirySoon`]: super::msgs::WebhookNotificationMethod::LSPS5ExpirySoon
-	pub fn notify_expiry_soon(&self, client_id: PublicKey, timeout: u32) {
+	pub fn notify_expiry_soon(
+		&self, client_id: PublicKey, timeout: u32,
+	) -> Result<(), LSPS5ProtocolError> {
 		let notification = WebhookNotification::expiry_soon(timeout);
 		self.broadcast_notification(client_id, notification)
 	}
@@ -356,7 +370,9 @@ where
 	/// - `client_id`: the client's node-ID whose webhooks should be invoked.
 	///
 	/// [`WebhookNotificationMethod::LSPS5LiquidityManagementRequest`]: super::msgs::WebhookNotificationMethod::LSPS5LiquidityManagementRequest
-	pub fn notify_liquidity_management_request(&self, client_id: PublicKey) {
+	pub fn notify_liquidity_management_request(
+		&self, client_id: PublicKey,
+	) -> Result<(), LSPS5ProtocolError> {
 		let notification = WebhookNotification::liquidity_management_request();
 		self.broadcast_notification(client_id, notification)
 	}
@@ -371,17 +387,21 @@ where
 	/// - `client_id`: the client's node-ID whose webhooks should be invoked.
 	///
 	/// [`WebhookNotificationMethod::LSPS5OnionMessageIncoming`]: super::msgs::WebhookNotificationMethod::LSPS5OnionMessageIncoming
-	pub fn notify_onion_message_incoming(&self, client_id: PublicKey) {
+	pub fn notify_onion_message_incoming(
+		&self, client_id: PublicKey,
+	) -> Result<(), LSPS5ProtocolError> {
 		let notification = WebhookNotification::onion_message_incoming();
 		self.broadcast_notification(client_id, notification)
 	}
 
-	fn broadcast_notification(&self, client_id: PublicKey, notification: WebhookNotification) {
+	fn broadcast_notification(
+		&self, client_id: PublicKey, notification: WebhookNotification,
+	) -> Result<(), LSPS5ProtocolError> {
 		let mut webhooks = self.webhooks.lock().unwrap();
 
 		let client_webhooks = match webhooks.get_mut(&client_id) {
 			Some(webhooks) if !webhooks.is_empty() => webhooks,
-			_ => return,
+			_ => return Ok(()),
 		};
 
 		let now =
@@ -402,20 +422,21 @@ where
 					app_name.clone(),
 					webhook.url.clone(),
 					notification.clone(),
-				);
+				)?;
 			}
 		}
+		Ok(())
 	}
 
 	fn send_notification(
 		&self, counterparty_node_id: PublicKey, app_name: LSPS5AppName, url: LSPS5WebhookUrl,
 		notification: WebhookNotification,
-	) {
+	) -> Result<(), LSPS5ProtocolError> {
 		let event_queue_notifier = self.event_queue.notifier();
 		let timestamp =
 			LSPSDateTime::new_from_duration_since_epoch(self.time_provider.duration_since_epoch());
 
-		let signature_hex = self.sign_notification(&notification, &timestamp);
+		let signature_hex = self.sign_notification(&notification, &timestamp)?;
 
 		let mut headers: HashMap<String, String> = [("Content-Type", "application/json")]
 			.into_iter()
@@ -431,16 +452,23 @@ where
 			notification,
 			headers,
 		});
+
+		Ok(())
 	}
 
-	fn sign_notification(&self, body: &WebhookNotification, timestamp: &LSPSDateTime) -> String {
+	fn sign_notification(
+		&self, body: &WebhookNotification, timestamp: &LSPSDateTime,
+	) -> Result<String, LSPS5ProtocolError> {
+		let notification_json =
+			serde_json::to_string(body).map_err(|_| LSPS5ProtocolError::SerializationError)?;
+
 		let message = format!(
 			"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {}",
 			timestamp.to_rfc3339(),
-			body
+			notification_json
 		);
 
-		message_signing::sign(message.as_bytes(), &self.config.signing_key)
+		Ok(message_signing::sign(message.as_bytes(), &self.config.signing_key))
 	}
 
 	fn prune_stale_webhooks(&self) {

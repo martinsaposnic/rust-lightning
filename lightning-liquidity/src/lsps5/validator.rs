@@ -100,10 +100,12 @@ where
 			return Err(LSPS5ClientError::InvalidTimestamp);
 		}
 
+		let notification_json = serde_json::to_string(notification)
+			.map_err(|_| LSPS5ClientError::SerializationError)?;
 		let message = format!(
 			"LSPS5: DO NOT SIGN THIS MESSAGE MANUALLY: LSP: At {} I notify {}",
 			signature_timestamp.to_rfc3339(),
-			notification
+			notification_json
 		);
 
 		if message_signing::verify(message.as_bytes(), signature, &counterparty_node_id) {

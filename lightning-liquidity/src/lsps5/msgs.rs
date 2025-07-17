@@ -49,6 +49,8 @@ pub const LSPS5_TOO_MANY_WEBHOOKS_ERROR_CODE: i32 = 503;
 pub const LSPS5_APP_NAME_NOT_FOUND_ERROR_CODE: i32 = 1010;
 /// An unknown error occurred.
 pub const LSPS5_UNKNOWN_ERROR_CODE: i32 = 1000;
+/// An error occurred during serialization of LSPS5 webhook notification.
+pub const LSPS5_SERIALIZATION_ERROR_CODE: i32 = 1001;
 
 pub(crate) const LSPS5_SET_WEBHOOK_METHOD_NAME: &str = "lsps5.set_webhook";
 pub(crate) const LSPS5_LIST_WEBHOOKS_METHOD_NAME: &str = "lsps5.list_webhooks";
@@ -98,6 +100,9 @@ pub enum LSPS5ProtocolError {
 
 	/// An unspecified or unexpected error occurred.
 	UnknownError,
+
+	/// Error during serialization of LSPS5 webhook notification.
+	SerializationError,
 }
 
 impl LSPS5ProtocolError {
@@ -112,6 +117,7 @@ impl LSPS5ProtocolError {
 			LSPS5ProtocolError::TooManyWebhooks => LSPS5_TOO_MANY_WEBHOOKS_ERROR_CODE,
 			LSPS5ProtocolError::AppNameNotFound => LSPS5_APP_NAME_NOT_FOUND_ERROR_CODE,
 			LSPS5ProtocolError::UnknownError => LSPS5_UNKNOWN_ERROR_CODE,
+			LSPS5ProtocolError::SerializationError => LSPS5_SERIALIZATION_ERROR_CODE,
 		}
 	}
 	/// The error message for the LSPS5 protocol error.
@@ -124,6 +130,9 @@ impl LSPS5ProtocolError {
 			LSPS5ProtocolError::TooManyWebhooks => "Maximum number of webhooks allowed per client",
 			LSPS5ProtocolError::AppNameNotFound => "App name not found",
 			LSPS5ProtocolError::UnknownError => "Unknown error",
+			LSPS5ProtocolError::SerializationError => {
+				"Error serializing LSPS5 webhook notification"
+			},
 		}
 	}
 }
@@ -162,6 +171,9 @@ pub enum LSPS5ClientError {
 	/// Indicates a potential replay attack where a previously seen
 	/// notification signature was reused.
 	ReplayAttack,
+
+	/// Error during serialization of LSPS5 webhook notification.
+	SerializationError,
 }
 
 impl LSPS5ClientError {
@@ -173,6 +185,7 @@ impl LSPS5ClientError {
 			InvalidSignature => Self::BASE + 1,
 			InvalidTimestamp => Self::BASE + 2,
 			ReplayAttack => Self::BASE + 3,
+			SerializationError => LSPS5_SERIALIZATION_ERROR_CODE,
 		}
 	}
 	/// The error message for the client error.
@@ -182,6 +195,7 @@ impl LSPS5ClientError {
 			InvalidSignature => "Invalid signature",
 			InvalidTimestamp => "Timestamp out of range",
 			ReplayAttack => "Replay attack detected",
+			SerializationError => "Error serializing LSPS5 webhook notification",
 		}
 	}
 }
@@ -496,15 +510,6 @@ impl WebhookNotification {
 	/// Create an onion_message_incoming notification.
 	pub fn onion_message_incoming() -> Self {
 		Self::new(WebhookNotificationMethod::LSPS5OnionMessageIncoming)
-	}
-}
-
-impl fmt::Display for WebhookNotification {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match serde_json::to_string(self) {
-			Ok(json) => f.write_str(&json),
-			Err(_) => Err(fmt::Error),
-		}
 	}
 }
 
