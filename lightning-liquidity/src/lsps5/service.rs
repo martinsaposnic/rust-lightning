@@ -81,8 +81,6 @@ impl TimeProvider for DefaultTimeProvider {
 pub struct LSPS5ServiceConfig {
 	/// Maximum number of webhooks allowed per client.
 	pub max_webhooks_per_client: u32,
-	/// Signing key for LSP notifications.
-	pub signing_key: SecretKey,
 	/// Minimum time between sending the same notification type in hours (default: 24)
 	pub notification_cooldown_hours: Duration,
 }
@@ -468,7 +466,9 @@ where
 			notification_json
 		);
 
-		Ok(message_signing::sign(message.as_bytes(), &self.config.signing_key))
+		// Get the node's secret key properly
+		let node_secret = self.channel_manager.get_cm().node_signer.get_node_secret_key();
+		Ok(message_signing::sign(message.as_bytes(), &node_secret))
 	}
 
 	fn prune_stale_webhooks(&self) {

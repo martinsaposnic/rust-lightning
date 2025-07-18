@@ -2,9 +2,6 @@
 
 mod common;
 
-use std::time::Duration;
-
-use bitcoin::secp256k1::SecretKey;
 use common::{create_service_and_client_nodes, get_lsps_message, LSPSNodes};
 
 use lightning_liquidity::events::LiquidityEvent;
@@ -23,6 +20,11 @@ use lightning::ln::functional_test_utils::{
 	create_chanmon_cfgs, create_network, create_node_cfgs, create_node_chanmgrs,
 };
 use lightning::ln::peer_handler::CustomMessageHandler;
+
+use bitcoin::secp256k1::SecretKey;
+
+use std::sync::Arc;
+use std::time::Duration;
 
 #[test]
 fn list_protocols_integration_test() {
@@ -66,8 +68,12 @@ fn list_protocols_integration_test() {
 	let service_node_id = nodes[0].node.get_our_node_id();
 	let client_node_id = nodes[1].node.get_our_node_id();
 
-	let LSPSNodes { service_node, client_node } =
-		create_service_and_client_nodes(nodes, service_config, client_config);
+	let LSPSNodes { service_node, client_node } = create_service_and_client_nodes(
+		nodes,
+		service_config,
+		client_config,
+		Arc::new(DefaultTimeProvider),
+	);
 
 	let client_handler = client_node.liquidity_manager.lsps0_client_handler();
 

@@ -109,8 +109,10 @@ where
 		);
 
 		if message_signing::verify(message.as_bytes(), signature, &counterparty_node_id) {
+			println!("Signature verified successfully for message: {}", message);
 			Ok(())
 		} else {
+			println!("Signature verification failed for message: {}", message);
 			Err(LSPS5ClientError::InvalidSignature)
 		}
 	}
