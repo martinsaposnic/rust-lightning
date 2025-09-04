@@ -44,6 +44,7 @@ pub struct LSPS1OrderId(pub String);
 /// more information.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct LSPS1GetInfoRequest {}
 
 /// An object representing the supported protocol options.
@@ -91,6 +92,7 @@ pub struct LSPS1GetInfoResponse {
 /// specification](https://github.com/lightning/blips/blob/master/blip-0051.md#2-lsps1create_order)
 /// for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LSPS1CreateOrderRequest {
 	/// The order made.
 	#[serde(flatten)]
@@ -104,6 +106,7 @@ pub struct LSPS1CreateOrderRequest {
 
 /// An object representing an bLIP-51 / LSPS1 channel order.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LSPS1OrderParams {
 	/// Indicates how many satoshi the LSP will provide on their side.
 	#[serde(with = "string_amount")]
@@ -278,6 +281,7 @@ pub struct LSPS1ChannelInfo {
 /// specification](https://github.com/lightning/blips/blob/master/blip-0051.md#21-lsps1get_order)
 /// for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LSPS1GetOrderRequest {
 	/// The id of the order.
 	pub order_id: LSPS1OrderId,
@@ -532,4 +536,144 @@ mod tests {
 		let payment_state: LSPS1PaymentState = serde_json::from_str(json_str).unwrap();
 		assert_eq!(payment_state, LSPS1PaymentState::Refunded);
 	}
+
+	#[test]
+	fn get_info_request_unknown_null_param_is_invalid() {
+		let json = r#"{
+        "jsonrpc": "2.0",
+        "id": "request:id:abc",
+        "method": "lsps1.get_info",
+        "params": { "unknown_param": null }
+    }"#;
+
+		let mut request_id_method_map = lightning::util::hash_tables::new_hash_map();
+		let msg = LSPSMessage::from_str_with_id_map(json, &mut request_id_method_map).unwrap();
+		match msg {
+			LSPSMessage::LSPS1(LSPS1Message::Response(id, LSPS1Response::GetInfoError(err))) => {
+				assert_eq!(id, LSPSRequestId("request:id:abc".to_string()));
+				assert_eq!(err.code, crate::lsps0::ser::JSONRPC_INVALID_PARAMS_ERROR_CODE);
+			},
+			_ => panic!("Unexpected message: {:?}", msg),
+		}
+	}
+
+	// Additional LSPS1 unknown-parameter tests
+	use crate::lsps0::ser::{
+		LSPSResponseError, JSONRPC_INVALID_PARAMS_ERROR_CODE, JSONRPC_INVALID_PARAMS_ERROR_MESSAGE,
+	};
+	use lightning::util::hash_tables::new_hash_map;
+
+	fn expected_invalid_params_err() -> LSPSResponseError {
+		LSPSResponseError {
+			code: JSONRPC_INVALID_PARAMS_ERROR_CODE,
+			message: JSONRPC_INVALID_PARAMS_ERROR_MESSAGE.to_string(),
+			data: None,
+		}
+	}
+
+	#[test]
+	fn deserializes_get_info_request_with_unknown_params() {
+		let json = r#"{
+        "jsonrpc": "2.0",
+        "id": "request:id:abc",
+        "method": "lsps1.get_info",
+        "params": { "unknown_param": "value" }
+    }"#;
+
+		let mut request_id_method_map = new_hash_map();
+		let msg = LSPSMessage::from_str_with_id_map(json, &mut request_id_method_map).unwrap();
+
+		match msg {
+			LSPSMessage::LSPS1(LSPS1Message::Response(id, LSPS1Response::GetInfoError(err))) => {
+				assert_eq!(id, LSPSRequestId("request:id:abc".to_string()));
+				assert_eq!(err, expected_invalid_params_err());
+			},
+			_ => panic!("Unexpected message: {:?}", msg),
+		}
+	}
+
+	#[test]
+	fn deserializes_create_order_request_with_unknown_params() {
+		let json = r#"{
+        "jsonrpc": "2.0",
+        "id": "request:id:abc",
+        "method": "lsps1.create_order",
+        "params": {
+            "lsp_balance_sat": "5000000",
+            "client_balance_sat": "2000000",
+            "required_channel_confirmations" : 0,
+            "funding_confirms_within_blocks": 6,
+            "channel_expiry_blocks": 144,
+            "token": "",
+            "announce_channel": true,
+            "extra_param": "value"
+        }
+    }"#;
+
+		let mut request_id_method_map = new_hash_map();
+		let msg = LSPSMessage::from_str_with_id_map(json, &mut request_id_method_map).unwrap();
+		match msg {
+			LSPSMessage::LSPS1(LSPS1Message::Response(
+				id,
+				LSPS1Response::CreateOrderError(err),
+			)) => {
+				assert_eq!(id, LSPSRequestId("request:id:abc".to_string()));
+				assert_eq!(err, expected_invalid_params_err());
+			},
+			_ => panic!("Unexpected message: {:?}", msg),
+		}
+	}
+
+	#[test]
+	fn create_order_request_allows_null_optional_fields() {
+		let json = r#"{
+        "jsonrpc": "2.0",
+        "id": "request:id:abc",
+        "method": "lsps1.create_order",
+        "params": {
+            "lsp_balance_sat": "5000000",
+            "client_balance_sat": "2000000",
+            "required_channel_confirmations" : 0,
+            "funding_confirms_within_blocks": 6,
+            "channel_expiry_blocks": 144,
+            "token": "",
+            "announce_channel": true,
+            "refund_onchain_address": null
+        }
+    }"#;
+
+		let mut request_id_method_map = new_hash_map();
+		let msg = LSPSMessage::from_str_with_id_map(json, &mut request_id_method_map).unwrap();
+		match msg {
+			LSPSMessage::LSPS1(LSPS1Message::Request(id, LSPS1Request::CreateOrder(_))) => {
+				assert_eq!(id, LSPSRequestId("request:id:abc".to_string()));
+			},
+			_ => panic!("Unexpected message: {:?}", msg),
+		}
+	}
+
+	#[test]
+	fn deserializes_get_order_request_with_unknown_params() {
+		let json = r#"{
+        "jsonrpc": "2.0",
+        "id": "request:id:abc",
+        "method": "lsps1.get_order",
+        "params": {
+            "order_id": "order-123",
+            "unknown_param": "x"
+        }
+    }"#;
+
+		let mut request_id_method_map = new_hash_map();
+		let msg = LSPSMessage::from_str_with_id_map(json, &mut request_id_method_map).unwrap();
+		match msg {
+			LSPSMessage::LSPS1(LSPS1Message::Response(id, LSPS1Response::GetOrderError(err))) => {
+				assert_eq!(id, LSPSRequestId("request:id:abc".to_string()));
+				assert_eq!(err, expected_invalid_params_err());
+			},
+			_ => panic!("Unexpected message: {:?}", msg),
+		}
+	}
+
+
 }

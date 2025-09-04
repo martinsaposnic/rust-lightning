@@ -15,6 +15,7 @@ pub(crate) const LSPS0_LISTPROTOCOLS_METHOD_NAME: &str = "lsps0.list_protocols";
 /// specification](https://github.com/lightning/blips/blob/master/blip-0050.md#lsps-specification-support-query)
 /// for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LSPS0ListProtocolsRequest {}
 
 /// A response to a `list_protocols` request.
@@ -99,7 +100,7 @@ mod tests {
 	use lightning::util::hash_tables::new_hash_map;
 
 	use super::*;
-	use crate::lsps0::ser::LSPSMethod;
+	use crate::lsps0::ser::{LSPSMethod, JSONRPC_INVALID_PARAMS_ERROR_CODE};
 
 	use alloc::string::ToString;
 
@@ -196,6 +197,37 @@ mod tests {
 	}
 
 	#[test]
+	fn deserializes_error_response_with_structured_data_is_accepted() {
+		let json = r#"{
+	        "jsonrpc": "2.0",
+	        "id": "request:id:xyz123",
+	        "error": {
+	            "code": -32602,
+				"message": "Invalid params",
+				"data": {"unknown_param": "foo", "path": ["a","b"]}
+	        }
+	    }"#;
+		let mut request_id_to_method_map = new_hash_map();
+		request_id_to_method_map
+			.insert(LSPSRequestId("request:id:xyz123".to_string()), LSPSMethod::LSPS0ListProtocols);
+
+		let response =
+			LSPSMessage::from_str_with_id_map(json, &mut request_id_to_method_map).unwrap();
+
+		if let LSPSMessage::LSPS0(LSPS0Message::Response(
+			_,
+			LSPS0Response::ListProtocolsError(err),
+		)) = response
+		{
+			assert_eq!(err.code, -32602);
+			assert_eq!(err.message.as_str(), "Invalid params");
+			assert!(err.data.is_some());
+		} else {
+			panic!("unexpected response variant");
+		}
+	}
+
+	#[test]
 	fn deserialize_fails_with_unknown_request_id() {
 		let json = r#"{
 	        "jsonrpc": "2.0",
@@ -223,5 +255,41 @@ mod tests {
 			json,
 			r#"{"jsonrpc":"2.0","id":"request:id:xyz123","result":{"protocols":[1,2,3]}}"#
 		);
+	}
+
+	#[test]
+	fn deserializes_request_with_unknown_params() {
+		let json = r#"{
+        "jsonrpc": "2.0",
+        "id": "request:id:abc",
+        "method": "lsps0.list_protocols",
+        "params": { "foo": "bar", "nested": { "x": 1 } }
+    }"#;
+
+		let mut request_id_method_map = new_hash_map();
+		let msg = LSPSMessage::from_str_with_id_map(json, &mut request_id_method_map).unwrap();
+
+		assert_eq!(
+			msg,
+			LSPSMessage::LSPS0(LSPS0Message::Response(
+				LSPSRequestId("request:id:abc".to_string()),
+				LSPS0Response::ListProtocolsError(LSPSResponseError {
+					code: JSONRPC_INVALID_PARAMS_ERROR_CODE,
+					message: "Invalid params".to_string(),
+					data: None,
+				})
+			))
+		);
+	}
+
+	#[test]
+	fn invalid_json_triggers_parse_error() {
+		// Malformed JSON should cause the LSPS JSON parser to error. The LiquidityManager
+		// surfaces this as a JSON-RPC parse error (-32700) in its reply, but here we
+		// only assert the deserialization error (unit-level signal).
+		let json = "{"; // invalid JSON
+		let mut map = new_hash_map();
+		let res = LSPSMessage::from_str_with_id_map(json, &mut map);
+		assert!(res.is_err());
 	}
 }
