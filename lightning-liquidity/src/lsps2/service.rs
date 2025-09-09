@@ -1023,9 +1023,9 @@ where
 	/// were being held for that JIT channel are forwarded. In a `client_trusts_lsp` flow, once
 	/// the fee has been fully paid, the channel's funding transaction will be broadcasted.
 	///
-	/// Note that `next_channel_id` and `skimmed_fee_msat` are required to be provided. Therefore, the corresponding
-	/// [`Event::PaymentForwarded`] events need to be generated and serialized by LDK versions
-	/// greater or equal to 0.0.122.
+	/// Note that `next_channel_id` and `skimmed_fee_msat` are required to be provided.
+	/// Therefore, the corresponding [`Event::PaymentForwarded`] events need to be generated and
+	/// serialized by LDK versions greater or equal to 0.0.122.
 	///
 	/// [`Event::PaymentForwarded`]: lightning::events::Event::PaymentForwarded
 	pub fn payment_forwarded(
@@ -1595,6 +1595,13 @@ where
 	/// Stores the funding transaction for a JIT channel.
 	///
 	/// Call this when the funding transaction is created.
+	///
+	/// In `client_trusts_lsp` the broadcasting of the funding transaction will be handled internally
+	/// after you also mark it as broadcast-safe via
+	/// [`set_funding_tx_broadcast_safe`] and once the opening fee has been collected. You do not need
+	/// to broadcast the funding transaction yourself in this flow.
+	///
+	/// [`set_funding_tx_broadcast_safe`]: Self::set_funding_tx_broadcast_safe
 	pub fn store_funding_transaction(
 		&self, user_channel_id: u128, counterparty_node_id: &PublicKey, funding_tx: Transaction,
 	) -> Result<(), APIError> {
@@ -1640,7 +1647,8 @@ where
 	/// the intercepted payment.
 	///
 	/// In a `client_trusts_lsp` flow, after this is set and the opening fee has been fully skimmed,
-	/// the channel's funding transaction will be broadcasted.
+	/// the channel's funding transaction will be broadcasted if the channel is still usable.
+	/// If the channel has been closed or force-closed before this point, the funding transaction will not be broadcasted.
 	///
 	/// [`Event::FundingTxBroadcastSafe`]: lightning::events::Event::FundingTxBroadcastSafe
 	pub fn set_funding_tx_broadcast_safe(
